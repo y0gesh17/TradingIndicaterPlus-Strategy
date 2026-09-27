@@ -1,0 +1,232 @@
+//@version=5
+indicator("Trend Volume & Price Momentum (Live Pivot Engine - Split Height)", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+//=========================
+// Inputs
+//=========================
+pivotLen = input.int(5, "Pivot Length", minval = 1)
+
+//=========================
+// Weekend Detection Logic
+//=========================
+isWeekend = dayofweek(time) == 7 or dayofweek(time) == 1
+
+//=========================
+// Pivot Detection
+//=========================
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+//=========================
+// Variables & State Tracking
+//=========================
+var int activeTrend = 0 // 1 = Accumulating Up, -1 = Accumulating Down, 0 = Initializing
+var float cumVol = 0.0
+
+var float startPrice = na
+var int startBar = na
+
+var int lastEndBar = na
+var float lastEndPrice = na
+
+// Historical trackers for previous moves to perform momentum math
+var float prevUpVol = na
+var float prevUpLen = na
+var float prevDownVol = na
+var float prevDownLen = na
+
+// Extreme boundary trackers inside the current box structure
+var float maxHigh = high
+var float minLow = low
+
+//=========================
+// PERSISTENT LIVE DRAWING TRACKERS
+//=========================
+var box liveBox = na
+var label liveLabel = na
+
+// Instantly delete live drawings from the previous tick to prevent cloning
+if not na(liveBox)
+    box.delete(liveBox)
+if not na(liveLabel)
+    label.delete(liveLabel)
+
+//=========================
+// 1. COMPLETE ACTIVE MOVES & INSTANTLY HANDOFF
+//=========================
+if activeTrend == 1 and not na(ph)
+    endPrice = ph
+    endBar = bar_index - pivotLen
+    
+    // 1. Open-to-Close difference for Signal Generation
+    float bodyDiff = math.abs(endPrice - startPrice)
+    
+    // 2. Total Box Height (Extreme High to Extreme Low) for next box handoff
+    float totalBoxHeight = maxHigh[pivotLen] - minLow[pivotLen]
+    
+    int barCount = endBar - startBar + 1
+    int midBar = int(math.floor((startBar + endBar) / 2))
+
+    // Calculate momentum using previous box's total actual height
+    float expectedMove = na
+    string calcStr = "\nExp: N/A"
+    
+    if not na(prevUpVol) and prevUpVol > 0
+        expectedMove := (prevUpLen * cumVol) / prevUpVol
+        calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct (O-C): " + str.tostring(bodyDiff, "#.##")
+        
+        // Signal trigger: Compares Expected Move against the Open-to-Close body difference
+        if not na(expectedMove) and expectedMove >= bodyDiff + 20.0 and not isWeekend
+            label.new(x=endBar, y=na, text="SELL", yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.normal)
+
+    // Structural Box (using extreme boundaries for the box container)
+    box.new(left=startBar, top=maxHigh[pivotLen], right=endBar, bottom=minLow[pivotLen], bgcolor=color.new(color.green, 100), border_color=color.new(color.green, 40))
+
+    // Data label pushed vertically outside/below the box
+    string reportTxt = "V: " + str.tostring(cumVol, format.volume) + "\nH (Total Height): " + str.tostring(totalBoxHeight, "#.##") + "\nDiff (O-C): " + str.tostring(bodyDiff, "#.##") + "\nB: " + str.tostring(barCount) + calcStr
+    label.new(x=midBar, y=na, text=reportTxt, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.green, 100), textcolor=color.green, size=size.small)
+
+    // HANDOFF: Send current volume and total extreme height to the NEXT box baseline storage
+    prevUpVol := cumVol
+    prevUpLen := totalBoxHeight
+
+    // --- REFINED SEAMLESS HANDOFF ---
+    lastEndBar := endBar
+    lastEndPrice := endPrice
+    
+    activeTrend := -1
+    startPrice := endPrice
+    startBar := endBar
+    
+    // Reset extreme boundary trackers for the new block
+    maxHigh := high
+    minLow := low
+    
+    // Recalculate historical volume from the pivot bar to the current bar
+    cumVol := 0.0
+    for i = 0 to pivotLen
+        cumVol += volume[i]
+        maxHigh := math.max(maxHigh, high[i])
+        minLow := math.min(minLow, low[i])
+
+if activeTrend == -1 and not na(pl)
+    endPrice = pl
+    endBar = bar_index - pivotLen
+    
+    // 1. Open-to-Close difference for Signal Generation
+    float bodyDiff = math.abs(startPrice - endPrice)
+    
+    // 2. Total Box Height (Extreme High to Extreme Low) for next box handoff
+    float totalBoxHeight = maxHigh[pivotLen] - minLow[pivotLen]
+    
+    int barCount = endBar - startBar + 1
+    int midBar = int(math.floor((startBar + endBar) / 2))
+
+    // Calculate momentum using previous box's total actual height
+    float expectedMove = na
+    string calcStr = "\nExp: N/A"
+
+    if not na(prevDownVol) and prevDownVol > 0
+        expectedMove := (prevDownLen * cumVol) / prevDownVol
+        calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct (O-C): " + str.tostring(bodyDiff, "#.##")
+        
+        // Signal trigger: Compares Expected Move against the Open-to-Close body difference
+        if not na(expectedMove) and expectedMove >= bodyDiff * 1.5 and not isWeekend
+            label.new(x=endBar, y=na, text="BUY", yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.normal)
+
+    // Structural Box (using extreme boundaries for the box container)
+    box.new(left=startBar, top=maxHigh[pivotLen], right=endBar, bottom=minLow[pivotLen], bgcolor=color.new(color.red, 100), border_color=color.new(color.red, 40))
+
+    // Data label pushed vertically outside/below the box
+    string reportTxt = "V: " + str.tostring(cumVol, format.volume) + "\nH (Total Height): " + str.tostring(totalBoxHeight, "#.##") + "\nDiff (O-C): " + str.tostring(bodyDiff, "#.##") + "\nB: " + str.tostring(barCount) + calcStr
+    label.new(x=midBar, y=na, text=reportTxt, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.red, 100), textcolor=color.red, size=size.small)
+
+    // HANDOFF: Send current volume and total extreme height to the NEXT box baseline storage
+    prevDownVol := cumVol
+    prevDownLen := totalBoxHeight
+
+    // --- REFINED SEAMLESS HANDOFF ---
+    lastEndBar := endBar
+    lastEndPrice := endPrice
+    
+    activeTrend := 1
+    startPrice := endPrice
+    startBar := endBar
+    
+    // Reset extreme boundary trackers for the new block
+    maxHigh := high
+    minLow := low
+    
+    // Recalculate historical volume from the pivot bar to the current bar
+    cumVol := 0.0
+    for i = 0 to pivotLen
+        cumVol += volume[i]
+        maxHigh := math.max(maxHigh, high[i])
+        minLow := math.min(minLow, low[i])
+
+//=========================
+// 2. INITIALIZATION ROUTINE
+//=========================
+if activeTrend == 0
+    if not na(pl)
+        activeTrend := 1
+        startPrice := pl
+        startBar := bar_index - pivotLen
+        cumVol := 0.0
+        maxHigh := high
+        minLow := low
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+            maxHigh := math.max(maxHigh, high[i])
+            minLow := math.min(minLow, low[i])
+    else if not na(ph)
+        activeTrend := -1
+        startPrice := ph
+        startBar := bar_index - pivotLen
+        cumVol := 0.0
+        maxHigh := high
+        minLow := low
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+            maxHigh := math.max(maxHigh, high[i])
+            minLow := math.min(minLow, low[i])
+
+//=========================
+// 3. ACCUMULATE VOLUME & BOUNDARIES
+//=========================
+else
+    cumVol += volume
+    maxHigh := math.max(maxHigh, high)
+    minLow := math.min(minLow, low)
+
+//=========================
+// 4. LIVE ENGINE LAYER (RUNS IN REAL-TIME)
+//=========================
+if activeTrend != 0
+    bool liveIsUp = (activeTrend == 1)
+    float liveBodyDiff = math.abs(close - startPrice)
+    float liveTotalBoxHeight = maxHigh - minLow
+    int liveBarCount = bar_index - startBar + 1
+    int liveMidBar = int(math.floor((startBar + bar_index) / 2))
+    
+    float liveExpectedMove = na
+    string liveCalcStr = "\nExp: N/A"
+    
+    // Project live targets using the last closed history baseline
+    if liveIsUp
+        if not na(prevUpVol) and prevUpVol > 0
+            liveExpectedMove := (prevUpLen * cumVol) / prevUpVol
+            liveCalcStr := "\nExp: " + str.tostring(liveExpectedMove, "#.##") + "\nAct (O-C): " + str.tostring(liveBodyDiff, "#.##")
+    else
+        if not na(prevDownVol) and prevDownVol > 0
+            liveExpectedMove := (prevDownLen * cumVol) / prevDownVol
+            liveCalcStr := "\nExp: " + str.tostring(liveExpectedMove, "#.##") + "\nAct (O-C): " + str.tostring(liveBodyDiff, "#.##")
+            
+    color liveColor = liveIsUp ? color.green : color.red
+    
+    // Render dynamic real-time dashed box boundaries using live extremes
+    liveBox := box.new(left=startBar, top=maxHigh, right=bar_index, bottom=minLow, bgcolor=color.new(liveColor, 96), border_color=color.new(liveColor, 50), border_style=line.style_dashed)
+    
+    // Render text label updating fluidly with incoming ticks
+    string liveTxt = "[LIVE] V: " + str.tostring(cumVol, format.volume) + "\nH (Total Height): " + str.tostring(liveTotalBoxHeight, "#.##") + "\nDiff (O-C): " + str.tostring(liveBodyDiff, "#.##") + "\nB: " + str.tostring(liveBarCount) + liveCalcStr
+    liveLabel := label.new(x=liveMidBar, y=na, text=liveTxt, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(liveColor, 100), textcolor=liveColor, size=size.small)

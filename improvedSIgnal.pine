@@ -1,0 +1,175 @@
+//@version=5
+indicator("Trend Volume & Price Momentum (Efficiency Model + Signals)", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+//=========================
+// Inputs
+//=========================
+pivotLen       = input.int(5, "Pivot Length", minval = 1)
+historyLength  = input.int(5, "History Length (N)", minval = 1)
+
+//=========================
+// Pivot Detection
+//=========================
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+//=========================
+// Variables & State Tracking
+//=========================
+var int activeTrend = 0 // 1 = Accumulating Up, -1 = Accumulating Down, 0 = Waiting
+var float cumVol = 0.0
+
+var float startPrice = na
+var int startBar = na
+
+var int lastEndBar = na
+var float lastEndPrice = na
+
+// Array queues to track historical efficiencies for up and down trends independently
+var float[] upHistory   = array.new_float(0)
+var float[] downHistory = array.new_float(0)
+
+//=========================
+// Helper Functions
+//=========================
+
+// Tracks historical values by pushing new data and maintaining a maximum size of N
+updateHistory(float[] histArray, float newValue, int maxLen) =>
+    array.push(histArray, newValue)
+    if array.size(histArray) > maxLen
+        array.shift(histArray)
+
+// Evaluates metrics, handles calculations, and determines proper text color based on confidence ratios
+getStatsAndColor(float currentVol, float actualLen, float[] histArray, int maxLen) =>
+    float efficiency = currentVol > 0 ? actualLen / currentVol : na
+    
+    // Store current efficiency into history tracking for future trends
+    if not na(efficiency)
+        updateHistory(histArray, efficiency, maxLen)
+        
+    // Calculate historical average (ignoring current index by referencing prior data size)
+    float sumEff = 0.0
+    int validCount = 0
+    int histSize = array.size(histArray)
+    
+    // We average elements prior to the latest addition to avoid self-referencing bias
+    if histSize > 1
+        for i = 0 to histSize - 2
+            sumEff += array.get(histArray, i)
+            validCount += 1
+            
+    float avgEfficiency = validCount > 0 ? sumEff / validCount : na
+    
+    // Compute projections
+    float expectedLen = not na(avgEfficiency) ? avgEfficiency * currentVol : na
+    float confidence = (not na(expectedLen) and expectedLen > 0) ? actualLen / expectedLen : na
+    float volPerPoint = actualLen > 0 ? currentVol / actualLen : na
+    
+    // Assign specific confidence colors based on performance bands
+    color textCol = color.gray
+    if not na(confidence)
+        if confidence >= 1.20
+            textCol := color.rgb(0, 100, 0) // Dark Green
+        else if confidence >= 1.00
+            textCol := color.green
+        else if confidence >= 0.80
+            textCol := color.orange
+        else
+            textCol := color.red
+            
+    // Format output strings dynamically
+    string expStr  = not na(expectedLen) ? str.tostring(expectedLen, "#.##") : "N/A"
+    string confStr = not na(confidence)  ? str.tostring(confidence, "#.##")  : "N/A"
+    string vppStr  = not na(volPerPoint)  ? str.tostring(volPerPoint, format.volume) : "N/A"
+    
+    [expStr, confStr, vppStr, textCol, confidence]
+
+//=========================
+// 1. COMPLETE ACTIVE MOVES
+//=========================
+
+if activeTrend == 1 and not na(ph)
+    endPrice = ph
+    endBar = bar_index - pivotLen
+    
+    priceLength = math.abs(endPrice - startPrice)
+    barCount = endBar - startBar + 1
+    midBar = math.floor((startBar + endBar) / 2)
+
+    // Execute core Trend Efficiency calculations
+    [expStr, confStr, vppStr, labelColor, confidence] = getStatsAndColor(cumVol, priceLength, upHistory, historyLength)
+
+    // Structural Box
+    box.new(left=startBar, top=endPrice, right=endBar, bottom=startPrice, bgcolor=color.new(color.green, 100), border_color=color.new(color.green, 40))
+
+    // Formatted Data Label (Pushed vertically below the panel)
+    label.new(x=midBar, y=na, 
+         text="V : " + str.tostring(cumVol, format.volume) + 
+              "\nL : " + str.tostring(priceLength, "#.##") + 
+              "\nB : " + str.tostring(barCount) + 
+              "\nExp : " + expStr + 
+              "\nConf : " + confStr + 
+              "\nV/P : " + vppStr, 
+         yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.green, 100), textcolor=labelColor, size=size.small)
+
+    // Generate Signal: If an up trend fails to reach expected efficiency (<0.80), trigger SELL
+    if not na(confidence) and confidence < 0.80
+        label.new(x=endBar, y=na, text="SELL", yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.normal)
+
+    lastEndBar := endBar
+    lastEndPrice := endPrice
+    activeTrend := 0
+
+if activeTrend == -1 and not na(pl)
+    endPrice = pl
+    endBar = bar_index - pivotLen
+    
+    priceLength = math.abs(startPrice - endPrice)
+    barCount = endBar - startBar + 1
+    midBar = math.floor((startBar + endBar) / 2)
+
+    // Execute core Trend Efficiency calculations
+    [expStr, confStr, vppStr, labelColor, confidence] = getStatsAndColor(cumVol, priceLength, downHistory, historyLength)
+
+    // Structural Box
+    box.new(left=startBar, top=startPrice, right=endBar, bottom=endPrice, bgcolor=color.new(color.red, 100), border_color=color.new(color.red, 40))
+
+    // Formatted Data Label (Pushed vertically below the panel)
+    label.new(x=midBar, y=na, 
+         text="V : " + str.tostring(cumVol, format.volume) + 
+              "\nL : " + str.tostring(priceLength, "#.##") + 
+              "\nB : " + str.tostring(barCount) + 
+              "\nExp : " + expStr + 
+              "\nConf : " + confStr + 
+              "\nV/P : " + vppStr, 
+         yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.red, 100), textcolor=labelColor, size=size.small)
+
+    // Generate Signal: If a down trend fails to reach expected efficiency (<0.80), trigger BUY
+    if not na(confidence) and confidence < 0.80
+        label.new(x=endBar, y=na, text="BUY", yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.normal)
+
+    lastEndBar := endBar
+    lastEndPrice := endPrice
+    activeTrend := 0
+
+//=========================
+// 2. START NEW MOVES
+//=========================
+
+if not na(pl) and activeTrend == 0
+    activeTrend := 1
+    cumVol := 0.0
+    startPrice := not na(lastEndPrice) ? lastEndPrice : pl
+    startBar   := not na(lastEndBar) ? lastEndBar : (bar_index - pivotLen)
+
+if not na(ph) and activeTrend == 0
+    activeTrend := -1
+    cumVol := 0.0
+    startPrice := not na(lastEndPrice) ? lastEndPrice : ph
+    startBar   := not na(lastEndBar) ? lastEndBar : (bar_index - pivotLen)
+
+//=========================
+// 3. ACCUMULATE VOLUME
+//=========================
+if activeTrend != 0
+    cumVol += volume

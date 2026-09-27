@@ -1,0 +1,174 @@
+//@version=5
+indicator("Trend Volume & Price Momentum (Alpha Engine - Fixed Blocks & Volume Ratios)", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+//=========================
+// Inputs
+//=========================
+boxLen       = input.int(12, "Fixed Box Length (Candles)", minval = 1, tooltip = "Forces evaluation exactly every N candles.")
+smoothingLen = input.int(4, "History Smoothing Length (Boxes)", minval = 1, tooltip = "Smooths out single-box volume/height anomalies.")
+atrLen       = input.int(14, "ATR Volatility Length")
+atrMult      = input.float(1.5, "ATR Threshold Multiplier", tooltip = "Replaces fixed point limits with dynamic volatility ranges.")
+filterWeekend= input.bool(false, "Filter Out Weekend Signals?")
+
+//=========================
+// Market Variables & Filters
+//=========================
+isWeekend = dayofweek(time) == 7 or dayofweek(time) == 1
+allowSignal = not filterWeekend or not isWeekend
+atr = ta.atr(atrLen)
+alpha = 2.0 / (smoothingLen + 1) // EMA smoothing multiplier for box history
+
+//=========================
+// State Tracking Variables
+//=========================
+var int barCounter  = 0
+var int startBar    = na
+var float blockOpen = na
+var float cumVol    = 0.0
+var float maxHigh   = na
+var float minLow    = na
+
+// Granular Buyer / Seller Tracking States
+var float buyVol    = 0.0
+var float sellVol   = 0.0
+var float buyLen    = 0.0
+var float sellLen   = 0.0
+
+// Smoothed efficiency baselines (Total Height / Volume)
+var float smoothUpEff = na
+var float smoothDownEff = na
+
+//=========================
+// PERSISTENT LIVE DRAWING TRACKERS
+//=========================
+var box liveBox = na
+var label liveLabel = na
+
+// Instantly purge real-time instances from the previous tick to avoid memory leaks
+if not na(liveBox)
+    box.delete(liveBox)
+if not na(liveLabel)
+    label.delete(liveLabel)
+
+//=========================
+// 1. BLOCK COUNTER & ACCUMULATION ENGINE
+//=========================
+barCounter := barCounter + 1
+
+bool isGreen = (close >= open)
+float candleHeight = high - low
+
+if barCounter == 1
+    startBar  := bar_index
+    blockOpen := open
+    cumVol    := volume
+    maxHigh   := high
+    minLow    := low
+    
+    // Init block tracking splits
+    buyVol  := isGreen ? volume : 0.0
+    sellVol := not isGreen ? volume : 0.0
+    buyLen  := isGreen ? candleHeight : 0.0
+    sellLen := not isGreen ? candleHeight : 0.0
+else
+    cumVol    := cumVol + volume
+    maxHigh   := math.max(maxHigh, high)
+    minLow    := math.min(minLow, low)
+    
+    // Split accumulation loops
+    if isGreen
+        buyVol := buyVol + volume
+        buyLen := buyLen + candleHeight
+    else
+        sellVol := sellVol + volume
+        sellLen := sellLen + candleHeight
+
+//=========================
+// 2. BLOCK COMPLETION & RATIO CALCULATION
+//=========================
+if barCounter == boxLen
+    float totalBoxHeight = maxHigh - minLow
+    bool isUpTrend = (close >= blockOpen) // Classify macro block trend
+    int midBar = int(math.floor((startBar + bar_index) / 2))
+    
+    // Calculate final directional ratios safely to prevent zero division
+    float buyRatio  = buyLen > 0 ? buyVol / buyLen : 0.0
+    float sellRatio = sellLen > 0 ? sellVol / sellLen : 0.0
+    
+    float expectedMove = na
+    string calcStr = "\nExp: N/A"
+    
+    // Generate text metrics string for structural insights
+    string ratioReport = "\n--- Additive Splits ---" + 
+                         "\nBuy V: " + str.tostring(buyVol, format.volume) + " | Ratio: " + str.tostring(buyRatio, "#.##") + 
+                         "\nSell V: " + str.tostring(sellVol, format.volume) + " | Ratio: " + str.tostring(sellRatio, "#.##")
+    
+    if isUpTrend
+        if not na(smoothUpEff)
+            expectedMove := smoothUpEff * cumVol
+            calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct (Height): " + str.tostring(totalBoxHeight, "#.##")
+            
+            if not na(expectedMove) and expectedMove >= totalBoxHeight + (atrMult * atr) and allowSignal
+                label.new(x=bar_index, y=na, text="SELL", yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.normal)
+
+        box.new(left=startBar, top=maxHigh, right=bar_index, bottom=minLow, bgcolor=color.new(color.green, 100), border_color=color.new(color.green, 40))
+        string reportTxt = "V (Total): " + str.tostring(cumVol, format.volume) + "\nH (Total): " + str.tostring(totalBoxHeight, "#.##") + ratioReport + "\nB: " + str.tostring(boxLen) + calcStr
+        label.new(x=midBar, y=na, text=reportTxt, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.green, 100), textcolor=color.green, size=size.small)
+
+        float currentEff = totalBoxHeight / (cumVol > 0 ? cumVol : 1.0)
+        smoothUpEff := na(smoothUpEff) ? currentEff : (alpha * currentEff + (1.0 - alpha) * smoothUpEff)
+    else
+        if not na(smoothDownEff)
+            expectedMove := smoothDownEff * cumVol
+            calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct (Height): " + str.tostring(totalBoxHeight, "#.##")
+            
+            if not na(expectedMove) and expectedMove >= totalBoxHeight + (atrMult * atr) and allowSignal
+                label.new(x=bar_index, y=na, text="BUY", yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.normal)
+
+        box.new(left=startBar, top=maxHigh, right=bar_index, bottom=minLow, bgcolor=color.new(color.red, 100), border_color=color.new(color.red, 40))
+        string reportTxt = "V (Total): " + str.tostring(cumVol, format.volume) + "\nH (Total): " + str.tostring(totalBoxHeight, "#.##") + ratioReport + "\nB: " + str.tostring(boxLen) + calcStr
+        label.new(x=midBar, y=na, text=reportTxt, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.red, 100), textcolor=color.red, size=size.small)
+
+        float currentEff = totalBoxHeight / (cumVol > 0 ? cumVol : 1.0)
+        smoothDownEff := na(smoothDownEff) ? currentEff : (alpha * currentEff + (1.0 - alpha) * smoothDownEff)
+    
+    // Reset counter parameters cleanly to cycle the next fixed container
+    barCounter := 0
+
+//=========================
+// 3. LIVE ENGINE LAYER (REAL-TIME RATIOS)
+//=========================
+else if barCounter > 0
+    bool liveIsUp = (close >= blockOpen)
+    float liveTotalBoxHeight = maxHigh - minLow
+    int liveMidBar = int(math.floor((startBar + bar_index) / 2))
+    
+    // Real-time calculation of metrics mid-block
+    float liveBuyRatio  = buyLen > 0 ? buyVol / buyLen : 0.0
+    float liveSellRatio = sellLen > 0 ? sellVol / sellLen : 0.0
+    
+    float liveExpectedMove = na
+    string liveCalcStr = "\nExp: N/A"
+    bool preSignalTriggered = false
+    
+    string liveRatioReport = "\n--- Additive Splits ---" + 
+                             "\nBuy V: " + str.tostring(buyVol, format.volume) + " | Ratio: " + str.tostring(liveBuyRatio, "#.##") + 
+                             "\nSell V: " + str.tostring(sellVol, format.volume) + " | Ratio: " + str.tostring(liveSellRatio, "#.##")
+    
+    if liveIsUp and not na(smoothUpEff)
+        liveExpectedMove := smoothUpEff * cumVol
+        liveCalcStr := "\nExp: " + str.tostring(liveExpectedMove, "#.##") + "\nAct (Height): " + str.tostring(liveTotalBoxHeight, "#.##")
+        preSignalTriggered := (liveExpectedMove >= liveTotalBoxHeight + (atrMult * atr))
+    else if not liveIsUp and not na(smoothDownEff)
+        liveExpectedMove := smoothDownEff * cumVol
+        liveCalcStr := "\nExp: " + str.tostring(liveExpectedMove, "#.##") + "\nAct (Height): " + str.tostring(liveTotalBoxHeight, "#.##")
+        preSignalTriggered := (liveExpectedMove >= liveTotalBoxHeight + (atrMult * atr))
+            
+    color liveColor = liveIsUp ? color.green : color.red
+    
+    liveBox := box.new(left=startBar, top=maxHigh, right=bar_index, bottom=minLow, bgcolor=color.new(liveColor, 96), border_color=color.new(liveColor, 50), border_style=line.style_dashed)
+    
+    string alertPrefix = preSignalTriggered ? "⚠️ [EXHAUSTION ANOMALY] " : "[LIVE] "
+    string liveTxt = alertPrefix + "V (Total): " + str.tostring(cumVol, format.volume) + "\nH (Total): " + str.tostring(liveTotalBoxHeight, "#.##") + liveRatioReport + "\nB: " + str.tostring(barCounter) + liveCalcStr
+    
+    liveLabel := label.new(x=liveMidBar, y=na, text=liveTxt, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(liveColor, 100), textcolor=liveColor, size=size.small)

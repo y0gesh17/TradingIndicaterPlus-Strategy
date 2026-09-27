@@ -1,0 +1,123 @@
+//@version=5
+indicator("Trend Volume & Price Length (Stacked Below)", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+//=========================
+// Inputs
+//=========================
+pivotLen = input.int(5, "Pivot Length", minval = 1)
+
+//=========================
+// Pivot Detection
+//=========================
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+//=========================
+// Variables & State Tracking
+//=========================
+var int activeTrend = 0 // 1 = Accumulating Up, -1 = Accumulating Down, 0 = Waiting for first pivot
+var float cumVol = 0.0
+
+var float startPrice = na
+var int startBar = na
+
+var int lastEndBar = na
+var float lastEndPrice = na
+
+//=========================
+// 1. COMPLETE ACTIVE MOVES FIRST
+//=========================
+
+if activeTrend == 1 and not na(ph)
+    endPrice = ph
+    endBar = bar_index - pivotLen
+    
+    priceLength = math.abs(endPrice - startPrice)
+    barCount = endBar - startBar + 1
+    midBar = math.floor((startBar + endBar) / 2)
+
+    // Structural Box
+    box.new(
+         left=startBar,
+         top=endPrice,
+         right=endBar,
+         bottom=startPrice,
+         bgcolor=color.new(color.green, 100),
+         border_color=color.new(color.green, 40),
+         border_style=line.style_solid,
+         border_width=1)
+
+    // Data label pushed vertically outside/below the box
+    label.new(
+         x=midBar,
+         y=na,
+         text="V: " + str.tostring(cumVol, format.volume) +
+              "\nL: " + str.tostring(priceLength, "#.##") +
+              "\nB: " + str.tostring(barCount),
+         yloc=yloc.belowbar,
+         style=label.style_label_up,
+         color=color.new(color.green, 100),
+         textcolor=color.green,
+         size=size.small)
+
+    lastEndBar := endBar
+    lastEndPrice := endPrice
+    activeTrend := 0
+
+if activeTrend == -1 and not na(pl)
+    endPrice = pl
+    endBar = bar_index - pivotLen
+    
+    priceLength = math.abs(startPrice - endPrice)
+    barCount = endBar - startBar + 1
+    midBar = math.floor((startBar + endBar) / 2)
+
+    // Structural Box
+    box.new(
+         left=startBar,
+         top=startPrice,
+         right=endBar,
+         bottom=endPrice,
+         bgcolor=color.new(color.red, 100),
+         border_color=color.new(color.red, 40),
+         border_style=line.style_solid,
+         border_width=1)
+
+    // Data label pushed vertically outside/below the box
+    label.new(
+         x=midBar,
+         y=na,
+         text="V: " + str.tostring(cumVol, format.volume) +
+              "\nL: " + str.tostring(priceLength, "#.##") +
+              "\nB: " + str.tostring(barCount),
+         yloc=yloc.belowbar,
+         style=label.style_label_up,
+         color=color.new(color.red, 100),
+         textcolor=color.red,
+         size=size.small)
+
+    lastEndBar := endBar
+    lastEndPrice := endPrice
+    activeTrend := 0
+
+//=========================
+// 2. START NEW MOVES
+//=========================
+
+if not na(pl) and activeTrend == 0
+    activeTrend := 1
+    cumVol := 0.0
+    startPrice := not na(lastEndPrice) ? lastEndPrice : pl
+    startBar   := not na(lastEndBar) ? lastEndBar : (bar_index - pivotLen)
+
+if not na(ph) and activeTrend == 0
+    activeTrend := -1
+    cumVol := 0.0
+    startPrice := not na(lastEndPrice) ? lastEndPrice : ph
+    startBar   := not na(lastEndBar) ? lastEndBar : (bar_index - pivotLen)
+
+//=========================
+// 3. ACCUMULATE VOLUME
+//=========================
+if activeTrend != 0
+    cumVol += volume

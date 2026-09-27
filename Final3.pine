@@ -1,0 +1,252 @@
+//@version=5
+indicator("Trend Volume & Price Momentum (Strict Underperformance Reversal)", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+//=========================
+// Inputs
+//=========================
+pivotLen      = input.int(5, "Pivot Length", minval = 1)
+minMovePoints = input.float(20.0, "Minimum Box Length (Points)", minval = 0.0)
+
+//=========================
+// Pivot Detection
+//=========================
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+//=========================
+// Variables & State Tracking
+//=========================
+var int activeTrend = 0 // 1 = Accumulating Up, -1 = Accumulating Down, 0 = Initializing
+var float cumVol = 0.0
+
+var float startPrice = na
+var int startBar = na
+
+// Multi-Box Merging Tracking Variables
+var float visualStartPrice = na
+var int visualStartBar = na
+var string lastDirection = ""
+var float mergedVol = 0.0
+
+var int lastEndBar = na
+var float lastEndPrice = na
+
+// Historical Structural Databases (Dynamic sizes)
+var float[] upStartPrices  = array.new_float(0)
+var float[] upVolHistory    = array.new_float(0)
+var float[] upLenHistory    = array.new_float(0)
+
+var float[] downStartPrices = array.new_float(0)
+var float[] downVolHistory  = array.new_float(0)
+var float[] downLenHistory  = array.new_float(0)
+
+//=========================
+// 1. COMPLETE ACTIVE MOVES & INSTANTLY HANDOFF
+//=========================
+
+if activeTrend == 1 and not na(ph)
+    endPrice = ph
+    endBar = bar_index - pivotLen
+    
+    priceLength = math.abs(endPrice - startPrice)
+    barCount = endBar - startBar + 1
+    midBar = math.floor((startBar + endBar) / 2)
+
+    string currentDirection = endPrice >= startPrice ? "UP" : "DOWN"
+
+    if priceLength > minMovePoints
+        float expectedMove = na
+        string calcStr = "\nExp: N/A"
+        string legStatusStr = ""
+        
+        float dynamicVolSum = 0.0
+        float dynamicLenSum = 0.0
+        int validMatchCount = 0
+        
+        int totalStoredUp = array.size(upStartPrices)
+        if totalStoredUp > 0
+            // Scan backward step-by-step through prior UP legs
+            for i = totalStoredUp - 1 to 0
+                float histStartPrice = array.get(upStartPrices, i)
+                
+                // CRITICAL STOP CONDITION: If the previous up-box started HIGHER, stop immediately
+                if histStartPrice > startPrice
+                    break
+                
+                // Otherwise, it is a valid historical box in the sequence (started lower)
+                dynamicVolSum += array.get(upVolHistory, i)
+                dynamicLenSum += array.get(upLenHistory, i)
+                validMatchCount += 1
+            
+            // Only calculate expected values if the chain wasn't immediately broken
+            if validMatchCount > 0 and dynamicVolSum > 0
+                float avgUpVol = dynamicVolSum / validMatchCount
+                float avgUpLen = dynamicLenSum / validMatchCount
+                expectedMove := (avgUpLen * cumVol) / avgUpVol
+                calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct: " + str.tostring(priceLength, "#.##")
+                legStatusStr := "\nLegs Averaged: " + str.tostring(validMatchCount)
+                
+                // STRICT SIGNAL TRIGGER: Only sell if expected > actual on an uptrend move
+                if not na(expectedMove) and expectedMove > priceLength
+                    label.new(x=endBar, y=na, text="SELL", yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.normal)
+            else
+                legStatusStr := "\nFirst Leg"
+        else
+            legStatusStr := "\nFirst Leg"
+
+        if currentDirection == lastDirection
+            mergedVol += cumVol
+        else
+            visualStartPrice := startPrice
+            visualStartBar := startBar
+            mergedVol := cumVol
+
+        color boxColor = currentDirection == "UP" ? color.green : color.red
+        color textColor = currentDirection == "UP" ? color.green : color.red
+        
+        float displayLength = math.abs(endPrice - visualStartPrice)
+        int displayBarCount = endBar - visualStartBar + 1
+        int displayMidBar = math.floor((visualStartBar + endBar) / 2)
+
+        box.new(left=visualStartBar, top=math.max(visualStartPrice, endPrice), right=endBar, bottom=math.min(visualStartPrice, endPrice), bgcolor=color.new(boxColor, 100), border_color=color.new(boxColor, 40))
+
+        label.new(x=displayMidBar, y=na, 
+             text="V: " + str.tostring(mergedVol, format.volume) + 
+                  "\nL: " + str.tostring(displayLength, "#.##") + 
+                  "\nB: " + str.tostring(displayBarCount) + calcStr + legStatusStr, 
+             yloc=yloc.belowbar, style=label.style_label_up, color=color.new(boxColor, 100), textcolor=textColor, size=size.small)
+
+        // Append current leg parameters to history cache
+        array.push(upStartPrices, startPrice)
+        array.push(upVolHistory, cumVol)
+        array.push(upLenHistory, priceLength)
+
+    lastDirection := currentDirection
+    lastEndBar := endBar
+    lastEndPrice := endPrice
+    
+    activeTrend := -1
+    startPrice := endPrice
+    startBar := endBar
+    
+    cumVol := 0.0
+    for i = 0 to pivotLen
+        cumVol += volume[i]
+
+if activeTrend == -1 and not na(pl)
+    endPrice = pl
+    endBar = bar_index - pivotLen
+    
+    priceLength = math.abs(startPrice - endPrice)
+    barCount = endBar - startBar + 1
+    midBar = math.floor((startBar + endBar) / 2)
+
+    string currentDirection = startPrice >= endPrice ? "DOWN" : "UP"
+
+    if priceLength > minMovePoints
+        float expectedMove = na
+        string calcStr = "\nExp: N/A"
+        string legStatusStr = ""
+
+        float dynamicVolSum = 0.0
+        float dynamicLenSum = 0.0
+        int validMatchCount = 0
+        
+        int totalStoredDown = array.size(downStartPrices)
+        if totalStoredDown > 0
+            // Scan backward step-by-step through prior DOWN legs
+            for i = totalStoredDown - 1 to 0
+                float histStartPrice = array.get(downStartPrices, i)
+                
+                // CRITICAL STOP CONDITION: If the previous down-box started LOWER, stop immediately
+                if histStartPrice < startPrice
+                    break
+                
+                // Otherwise, it is a valid historical box in the sequence (started higher)
+                dynamicVolSum += array.get(downVolHistory, i)
+                dynamicLenSum += array.get(downLenHistory, i)
+                validMatchCount += 1
+            
+            // Only calculate expected values if the chain wasn't immediately broken
+            if validMatchCount > 0 and dynamicVolSum > 0
+                float avgDownVol = dynamicVolSum / validMatchCount
+                float avgDownLen = dynamicLenSum / validMatchCount
+                expectedMove := (avgDownLen * cumVol) / avgDownVol
+                calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct: " + str.tostring(priceLength, "#.##")
+                legStatusStr := "\nLegs Averaged: " + str.tostring(validMatchCount)
+                
+                // STRICT SIGNAL TRIGGER: Only buy if expected > actual on a downtrend move
+                if not na(expectedMove) and expectedMove > priceLength
+                    label.new(x=endBar, y=na, text="BUY", yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.normal)
+            else
+                legStatusStr := "\nFirst Leg"
+        else
+            legStatusStr := "\nFirst Leg"
+
+        if currentDirection == lastDirection
+            mergedVol += cumVol
+        else
+            visualStartPrice := startPrice
+            visualStartBar := startBar
+            mergedVol := cumVol
+
+        color boxColor = currentDirection == "DOWN" ? color.red : color.green
+        color textColor = currentDirection == "DOWN" ? color.red : color.green
+
+        float displayLength = math.abs(visualStartPrice - endPrice)
+        int displayBarCount = endBar - visualStartBar + 1
+        int displayMidBar = math.floor((visualStartBar + endBar) / 2)
+
+        box.new(left=visualStartBar, top=math.max(visualStartPrice, endPrice), right=endBar, bottom=math.min(visualStartPrice, endPrice), bgcolor=color.new(boxColor, 100), border_color=color.new(boxColor, 40))
+
+        label.new(x=displayMidBar, y=na, 
+             text="V: " + str.tostring(mergedVol, format.volume) + 
+                  "\nL: " + str.tostring(displayLength, "#.##") + 
+                  "\nB: " + str.tostring(displayBarCount) + calcStr + legStatusStr, 
+             yloc=yloc.belowbar, style=label.style_label_up, color=color.new(boxColor, 100), textcolor=textColor, size=size.small)
+
+        // Append current leg parameters to history cache
+        array.push(downStartPrices, startPrice)
+        array.push(downVolHistory, cumVol)
+        array.push(downLenHistory, priceLength)
+
+    lastDirection := currentDirection
+    lastEndBar := endBar
+    lastEndPrice := endPrice
+    
+    activeTrend := 1
+    startPrice := endPrice
+    startBar := endBar
+    
+    cumVol := 0.0
+    for i = 0 to pivotLen
+        cumVol += volume[i]
+
+//=========================
+// 2. INITIALIZATION ROUTINE
+//=========================
+if activeTrend == 0
+    if not na(pl)
+        activeTrend := 1
+        startPrice := pl
+        startBar := bar_index - pivotLen
+        visualStartPrice := pl
+        visualStartBar := bar_index - pivotLen
+        cumVol := 0.0
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+    else if not na(ph)
+        activeTrend := -1
+        startPrice := ph
+        startBar := bar_index - pivotLen
+        visualStartPrice := ph
+        visualStartBar := bar_index - pivotLen
+        cumVol := 0.0
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+
+//=========================
+// 3. ACCUMULATE VOLUME
+//=========================
+else
+    cumVol += volume

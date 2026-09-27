@@ -1,0 +1,336 @@
+//@version=5
+indicator("Trend Volume & Price Momentum (MTF Top-Down Fixed)", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+//=========================
+// Inputs
+//=========================
+pivotLen      = input.int(5, "Local Pivot Length", minval = 1, group="Core Settings")
+minMovePoints = input.float(20.0, "Minimum Box Length (Points)", minval = 0.0, group="Core Settings")
+
+useMtf        = input.bool(true, "Require MTF Alignment (Top-Down)", group="MTF Settings")
+htf1_res      = input.timeframe("15", "Higher Timeframe 1", group="MTF Settings")
+htf1_pLen     = input.int(5, "HTF 1 Pivot Length", minval = 1, group="MTF Settings")
+
+htf2_res      = input.timeframe("60", "Higher Timeframe 2 (Highest)", group="MTF Settings")
+htf2_pLen     = input.int(1, "HTF 2 Pivot Length (Keep low to prevent lag)", minval = 1, group="MTF Settings")
+
+//=========================
+// MTF Logic Function
+//=========================
+f_get_mtf_state(pLen, minPts) =>
+    var int aTrend = 0 
+    var float cVol = 0.0
+    var float sPrice = na
+    
+    var float[] uStart = array.new_float(0)
+    var float[] uVol   = array.new_float(0)
+    var float[] uLen   = array.new_float(0)
+    var float[] dStart = array.new_float(0)
+    var float[] dVol   = array.new_float(0)
+    var float[] dLen   = array.new_float(0)
+    
+    // Changed to persistent state tracking variables
+    var bool stBuy = false
+    var bool stSell = false
+    
+    h_ph = ta.pivothigh(high, pLen, pLen)
+    h_pl = ta.pivotlow(low, pLen, pLen)
+    
+    if aTrend == 1 and not na(h_ph)
+        pLen_val = math.abs(h_ph - sPrice)
+        if pLen_val > minPts
+            float expM = na
+            float dVolSum = 0.0
+            float dLenSum = 0.0
+            int vMatch = 0
+            
+            int tStored = array.size(uStart)
+            if tStored > 0
+                float subStart = sPrice
+                for i = tStored - 1 to 0
+                    float curStart = array.get(uStart, i)
+                    if curStart >= subStart
+                        break
+                    dVolSum += array.get(uVol, i)
+                    dLenSum += array.get(uLen, i)
+                    vMatch += 1
+                    subStart := curStart
+                    
+                if vMatch > 0 and dVolSum > 0
+                    expM := ((dLenSum / vMatch) * cVol) / (dVolSum / vMatch)
+                    if not na(expM) and expM > pLen_val
+                        stSell := true
+                        stBuy := false
+            
+            array.push(uStart, sPrice)
+            array.push(uVol, cVol)
+            array.push(uLen, pLen_val)
+            
+        aTrend := -1
+        sPrice := h_ph
+        cVol := 0.0
+        for i = 0 to pLen
+            cVol += volume[i]
+
+    if aTrend == -1 and not na(h_pl)
+        pLen_val = math.abs(sPrice - h_pl)
+        if pLen_val > minPts
+            float expM = na
+            float dVolSum = 0.0
+            float dLenSum = 0.0
+            int vMatch = 0
+            
+            int tStored = array.size(dStart)
+            if tStored > 0
+                float subStart = sPrice
+                for i = tStored - 1 to 0
+                    float curStart = array.get(dStart, i)
+                    if curStart <= subStart
+                        break
+                    dVolSum += array.get(dVol, i)
+                    dLenSum += array.get(dLen, i)
+                    vMatch += 1
+                    subStart := curStart
+                    
+                if vMatch > 0 and dVolSum > 0
+                    expM := ((dLenSum / vMatch) * cVol) / (dVolSum / vMatch)
+                    if not na(expM) and expM > pLen_val
+                        stBuy := true
+                        stSell := false
+            
+            array.push(dStart, sPrice)
+            array.push(dVol, cVol)
+            array.push(dLen, pLen_val)
+            
+        aTrend := 1
+        sPrice := h_pl
+        cVol := 0.0
+        for i = 0 to pLen
+            cVol += volume[i]
+
+    if aTrend == 0
+        if not na(h_pl)
+            aTrend := 1
+            sPrice := h_pl
+            cVol := 0.0
+            for i = 0 to pLen
+                cVol += volume[i]
+        else if not na(h_ph)
+            aTrend := -1
+            sPrice := h_ph
+            cVol := 0.0
+            for i = 0 to pLen
+                cVol += volume[i]
+    else
+        cVol += volume
+        
+    [stBuy, stSell]
+
+// Fetch HTF States utilizing independent structural lengths
+[htf1_buy, htf1_sell] = request.security(syminfo.tickerid, htf1_res, f_get_mtf_state(htf1_pLen, minMovePoints))
+[htf2_buy, htf2_sell] = request.security(syminfo.tickerid, htf2_res, f_get_mtf_state(htf2_pLen, minMovePoints))
+
+//=========================
+// Chart Timeframe Pivot Detection & Tracking
+//=========================
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+var int activeTrend = 0 
+var float cumVol = 0.0
+var float startPrice = na
+var int startBar = na
+
+var float visualStartPrice = na
+var int visualStartBar = na
+var string lastDirection = ""
+var float mergedVol = 0.0
+
+var float[] upStartPrices  = array.new_float(0)
+var float[] upVolHistory   = array.new_float(0)
+var float[] upLenHistory   = array.new_float(0)
+
+var float[] downStartPrices = array.new_float(0)
+var float[] downVolHistory  = array.new_float(0)
+var float[] downLenHistory  = array.new_float(0)
+
+//=========================
+// COMPLETE ACTIVE MOVES & DRAWINGS
+//=========================
+
+if activeTrend == 1 and not na(ph)
+    endPrice = ph
+    endBar = bar_index - pivotLen
+    
+    priceLength = math.abs(endPrice - startPrice)
+    string currentDirection = endPrice >= startPrice ? "UP" : "DOWN"
+
+    if priceLength > minMovePoints
+        float expectedMove = na
+        string calcStr = "\nExp: N/A"
+        string legStatusStr = ""
+        
+        float dynamicVolSum = 0.0
+        float dynamicLenSum = 0.0
+        int validMatchCount = 0
+        
+        int totalStoredUp = array.size(upStartPrices)
+        if totalStoredUp > 0
+            float subsequentStartPrice = startPrice
+            
+            for i = totalStoredUp - 1 to 0
+                float currentHistStartPrice = array.get(upStartPrices, i)
+                if currentHistStartPrice >= subsequentStartPrice
+                    break
+                
+                dynamicVolSum += array.get(upVolHistory, i)
+                dynamicLenSum += array.get(upLenHistory, i)
+                validMatchCount += 1
+                subsequentStartPrice := currentHistStartPrice
+            
+            if validMatchCount > 0 and dynamicVolSum > 0
+                float avgUpVol = dynamicVolSum / validMatchCount
+                float avgUpLen = dynamicLenSum / validMatchCount
+                expectedMove := (avgUpLen * cumVol) / avgUpVol
+                calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct: " + str.tostring(priceLength, "#.##")
+                legStatusStr := "\nLegs Averaged: " + str.tostring(validMatchCount)
+                
+                if not na(expectedMove) and expectedMove > priceLength
+                    bool htfAligned = useMtf ? (htf1_sell and htf2_sell) : true
+                    if htfAligned
+                        label.new(x=endBar, y=na, text="SELL", yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.normal)
+            else
+                legStatusStr := "\nFirst Leg"
+        else
+            legStatusStr := "\nFirst Leg"
+
+        if currentDirection == lastDirection
+            mergedVol += cumVol
+        else
+            visualStartPrice := startPrice
+            visualStartBar := startBar
+            mergedVol := cumVol
+
+        color boxColor = currentDirection == "UP" ? color.green : color.red
+        color textColor = currentDirection == "UP" ? color.green : color.red
+        
+        float displayLength = math.abs(endPrice - visualStartPrice)
+        int displayBarCount = endBar - visualStartBar + 1
+        int displayMidBar = math.floor((visualStartBar + endBar) / 2)
+
+        box.new(left=visualStartBar, top=math.max(visualStartPrice, endPrice), right=endBar, bottom=math.min(visualStartPrice, endPrice), bgcolor=color.new(boxColor, 100), border_color=color.new(boxColor, 40))
+        label.new(x=displayMidBar, y=na, text="V: " + str.tostring(mergedVol, format.volume) + "\nL: " + str.tostring(displayLength, "#.##") + "\nB: " + str.tostring(displayBarCount) + calcStr + legStatusStr, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(boxColor, 100), textcolor=textColor, size=size.small)
+
+        array.push(upStartPrices, startPrice)
+        array.push(upVolHistory, cumVol)
+        array.push(upLenHistory, priceLength)
+
+    lastDirection := currentDirection
+    activeTrend := -1
+    startPrice := endPrice
+    startBar := endBar
+    
+    cumVol := 0.0
+    for i = 0 to pivotLen
+        cumVol += volume[i]
+
+if activeTrend == -1 and not na(pl)
+    endPrice = pl
+    endBar = bar_index - pivotLen
+    
+    priceLength = math.abs(startPrice - endPrice)
+    string currentDirection = startPrice >= endPrice ? "DOWN" : "UP"
+
+    if priceLength > minMovePoints
+        float expectedMove = na
+        string calcStr = "\nExp: N/A"
+        string legStatusStr = ""
+
+        float dynamicVolSum = 0.0
+        float dynamicLenSum = 0.0
+        int validMatchCount = 0
+        
+        int totalStoredDown = array.size(downStartPrices)
+        if totalStoredDown > 0
+            float subsequentStartPrice = startPrice
+            
+            for i = totalStoredDown - 1 to 0
+                float currentHistStartPrice = array.get(downStartPrices, i)
+                if currentHistStartPrice <= subsequentStartPrice
+                    break
+                
+                dynamicVolSum += array.get(downVolHistory, i)
+                dynamicLenSum += array.get(downLenHistory, i)
+                validMatchCount += 1
+                subsequentStartPrice := currentHistStartPrice
+            
+            if validMatchCount > 0 and dynamicVolSum > 0
+                float avgDownVol = dynamicVolSum / validMatchCount
+                float avgDownLen = dynamicLenSum / validMatchCount
+                expectedMove := (avgDownLen * cumVol) / avgDownVol
+                calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct: " + str.tostring(priceLength, "#.##")
+                legStatusStr := "\nLegs Averaged: " + str.tostring(validMatchCount)
+                
+                if not na(expectedMove) and expectedMove > priceLength
+                    bool htfAligned = useMtf ? (htf1_buy and htf2_buy) : true
+                    if htfAligned
+                        label.new(x=endBar, y=na, text="BUY", yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.normal)
+            else
+                legStatusStr := "\nFirst Leg"
+        else
+            legStatusStr := "\nFirst Leg"
+
+        if currentDirection == lastDirection
+            mergedVol += cumVol
+        else
+            visualStartPrice := startPrice
+            visualStartBar := startBar
+            mergedVol := cumVol
+
+        color boxColor = currentDirection == "DOWN" ? color.red : color.green
+        color textColor = currentDirection == "DOWN" ? color.red : color.green
+
+        float displayLength = math.abs(visualStartPrice - endPrice)
+        int displayBarCount = endBar - visualStartBar + 1
+        int displayMidBar = math.floor((visualStartBar + endBar) / 2)
+
+        box.new(left=visualStartBar, top=math.max(visualStartPrice, endPrice), right=endBar, bottom=math.min(visualStartPrice, endPrice), bgcolor=color.new(boxColor, 100), border_color=color.new(boxColor, 40))
+        label.new(x=displayMidBar, y=na, text="V: " + str.tostring(mergedVol, format.volume) + "\nL: " + str.tostring(displayLength, "#.##") + "\nB: " + str.tostring(displayBarCount) + calcStr + legStatusStr, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(boxColor, 100), textcolor=textColor, size=size.small)
+
+        array.push(downStartPrices, startPrice)
+        array.push(downVolHistory, cumVol)
+        array.push(downLenHistory, priceLength)
+
+    lastDirection := currentDirection
+    activeTrend := 1
+    startPrice := endPrice
+    startBar := endBar
+    
+    cumVol := 0.0
+    for i = 0 to pivotLen
+        cumVol += volume[i]
+
+//=========================
+// INITIALIZATION ROUTINE
+//=========================
+if activeTrend == 0
+    if not na(pl)
+        activeTrend := 1
+        startPrice := pl
+        startBar := bar_index - pivotLen
+        visualStartPrice := pl
+        visualStartBar := bar_index - pivotLen
+        cumVol := 0.0
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+    else if not na(ph)
+        activeTrend := -1
+        startPrice := ph
+        startBar := bar_index - pivotLen
+        visualStartPrice := ph
+        visualStartBar := bar_index - pivotLen
+        cumVol := 0.0
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+else
+    cumVol += volume

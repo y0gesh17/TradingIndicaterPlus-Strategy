@@ -1,0 +1,436 @@
+//@version=5
+strategy("Trend Volume & Price Momentum (Alpha Engine - SL & TP)", overlay = true, max_boxes_count = 500, max_labels_count = 500, initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100)
+
+//=========================
+// Inputs
+//=========================
+pivotLen        = input.int(5, "Pivot Length", minval = 1)
+smoothingLen    = input.int(4, "History Smoothing Length (Boxes)", minval = 1, tooltip = "Smooths out single-box volume/height anomalies.")
+atrLen          = input.int(14, "ATR Volatility Length")
+atrMult         = input.float(1.5, "ATR Threshold Multiplier", tooltip = "Replaces fixed point limits with dynamic volatility ranges.")
+filterWeekend   = input.bool(false, "Filter Out Weekend Signals?")
+
+//=========================
+// Market Variables & Filters
+//=========================
+isWeekend = dayofweek(time) == 7 or dayofweek(time) == 1
+allowSignal = not filterWeekend or not isWeekend
+atr = ta.atr(atrLen)
+alpha = 2.0 / (smoothingLen + 1)
+
+// Pivot Detection
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+//=========================
+// State Tracking Variables
+//=========================
+var int activeTrend = 0
+var float cumVol = 0.0
+var float startPrice = na
+var int startBar = na
+
+// Granular Buyer / Seller Tracking States
+var float buyVol    = 0.0
+var float sellVol   = 0.0
+var float buyLen    = 0.0
+var float sellLen   = 0.0
+
+// Smoothed efficiency baselines
+var float smoothUpEff = na
+var float smoothDownEff = na
+
+// Extreme boundary trackers and their locations
+var float maxHigh = high
+var float minLow = low
+var int maxHighBar = na
+var int minLowBar = na
+
+// Persistent previous box ratio tracking for comparison arrows
+var float lastBoxBuyRatio = na
+var float lastBoxSellRatio = na
+
+//=========================
+// PERSISTENT LIVE DRAWING TRACKERS
+//=========================
+var box liveBox = na
+var label liveLabel = na
+
+if not na(liveBox)
+    box.delete(liveBox)
+if not na(liveLabel)
+    label.delete(liveLabel)
+
+//=========================
+// 1. COMPLETE ACTIVE MOVES & INSTANTLY HANDOFF VIA PIVOTS
+//=========================
+if activeTrend == 1 and not na(ph)
+    endBar = bar_index - pivotLen
+    float totalBoxHeight = maxHigh[pivotLen] - minLow[pivotLen]
+    float expectedMove = na
+    
+    float actBuyVol = 0.0
+    float actSellVol = 0.0
+    float actBuyLen = 0.0
+    float actSellLen = 0.0
+    int totalBoxBars = bar_index - startBar
+    
+    for i = pivotLen to totalBoxBars
+        bool isG = (close[i] >= open[i])
+        float hg = high[i] - low[i]
+        if isG
+            actBuyVol  += volume[i]
+            actBuyLen  += hg
+        else
+            actSellVol += volume[i]
+            actSellLen += hg
+            
+    float buyRatio  = actBuyLen > 0 ? actBuyVol / actBuyLen : 0.0
+    float sellRatio = actSellLen > 0 ? actSellVol / actSellLen : 0.0
+    
+    // Trend Comparison Arrows vs Previous Box
+    string buyArrow  = na(lastBoxBuyRatio) ? "—" : (buyRatio > lastBoxBuyRatio ? "▲ (Inc)" : "▼ (Dec)")
+    string sellArrow = na(lastBoxSellRatio) ? "—" : (sellRatio > lastBoxSellRatio ? "▲ (Inc)" : "▼ (Dec)")
+    
+    lastBoxBuyRatio  := buyRatio
+    lastBoxSellRatio := sellRatio
+    
+    if not na(smoothUpEff)
+        expectedMove := smoothUpEff * cumVol[pivotLen]
+        if not na(expectedMove) and expectedMove >= totalBoxHeight + (atrMult * atr[pivotLen]) and allowSignal and (actSellVol > actBuyVol)
+            label.new(x=endBar, y=na, text="▼", yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+            strategy.entry("Sell", strategy.short)
+
+    string expStr = not na(expectedMove) ? str.tostring(expectedMove, "#.##") : "N/A"
+    string boxTxt = "V: " + str.tostring(cumVol[pivotLen], format.volume) + "\nAct H: " + str.tostring(totalBoxHeight, "#.##") + "\nExp H: " + expStr + "\nBuy Vol: " + str.tostring(actBuyVol, format.volume) + "\nSell Vol: " + str.tostring(actSellVol, format.volume) + "\nBuy Ratio: " + str.tostring(buyRatio, "#.##") + " " + buyArrow + "\nSell Ratio: " + str.tostring(sellRatio, "#.##") + " " + sellArrow
+
+    box.new(left=startBar, top=maxHigh[pivotLen], right=endBar, bottom=minLow[pivotLen], bgcolor=color.new(color.green, 92), border_color=color.new(color.green, 40))
+    label.new(x=math.round((startBar + endBar) / 2), y=maxHigh[pivotLen], text=boxTxt, color=color.new(color.green, 90), textcolor=color.green, style=label.style_label_down, size=size.small)
+
+    float currentEff = totalBoxHeight / (cumVol[pivotLen] > 0 ? cumVol[pivotLen] : 1.0)
+    smoothUpEff := na(smoothUpEff) ? currentEff : (alpha * currentEff + (1.0 - alpha) * smoothUpEff)
+
+    activeTrend := -1
+    startPrice := ph
+    startBar := endBar
+    maxHigh := high
+    minLow := low
+    maxHighBar := bar_index
+    minLowBar := bar_index
+    cumVol  := 0.0
+    buyVol  := 0.0
+    sellVol := 0.0
+    buyLen  := 0.0
+    sellLen := 0.0
+    for i = 0 to pivotLen
+        cumVol += volume[i]
+        if high[i] > maxHigh
+            maxHigh := high[i]
+            maxHighBar := bar_index - i
+        if low[i] < minLow
+            minLow := low[i]
+            minLowBar := bar_index - i
+        bool isGreen = (close[i] >= open[i])
+        float cHeight = high[i] - low[i]
+        if isGreen
+            buyVol  += volume[i]
+            buyLen  += cHeight
+        else
+            sellVol += volume[i]
+            sellLen += cHeight
+
+if activeTrend == -1 and not na(pl)
+    endBar = bar_index - pivotLen
+    float totalBoxHeight = maxHigh[pivotLen] - minLow[pivotLen]
+    float expectedMove = na
+
+    float actBuyVol = 0.0
+    float actSellVol = 0.0
+    float actBuyLen = 0.0
+    float actSellLen = 0.0
+    int totalBoxBars = bar_index - startBar
+    
+    for i = pivotLen to totalBoxBars
+        bool isG = (close[i] >= open[i])
+        float hg = high[i] - low[i]
+        if isG
+            actBuyVol  += volume[i]
+            actBuyLen  += hg
+        else
+            actSellVol += volume[i]
+            actSellLen += hg
+            
+    float buyRatio  = actBuyLen > 0 ? actBuyVol / actBuyLen : 0.0
+    float sellRatio = actSellLen > 0 ? actSellVol / actSellLen : 0.0
+    
+    // Trend Comparison Arrows vs Previous Box
+    string buyArrow  = na(lastBoxBuyRatio) ? "—" : (buyRatio > lastBoxBuyRatio ? "▲ (Inc)" : "▼ (Dec)")
+    string sellArrow = na(lastBoxSellRatio) ? "—" : (sellRatio > lastBoxSellRatio ? "▲ (Inc)" : "▼ (Dec)")
+    
+    lastBoxBuyRatio  := buyRatio
+    lastBoxSellRatio := sellRatio
+    
+    if not na(smoothDownEff)
+        expectedMove := smoothDownEff * cumVol[pivotLen]
+        if not na(expectedMove) and expectedMove >= totalBoxHeight + (atrMult * atr[pivotLen]) and allowSignal and (actBuyVol > actSellVol)
+            label.new(x=endBar, y=na, text="▲", yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+            strategy.entry("Buy", strategy.long)
+
+    string expStr = not na(expectedMove) ? str.tostring(expectedMove, "#.##") : "N/A"
+    string boxTxt = "V: " + str.tostring(cumVol[pivotLen], format.volume) + "\nAct H: " + str.tostring(totalBoxHeight, "#.##") + "\nExp H: " + expStr + "\nBuy Vol: " + str.tostring(actBuyVol, format.volume) + "\nSell Vol: " + str.tostring(actSellVol, format.volume) + "\nBuy Ratio: " + str.tostring(buyRatio, "#.##") + " " + buyArrow + "\nSell Ratio: " + str.tostring(sellRatio, "#.##") + " " + sellArrow
+
+    box.new(left=startBar, top=maxHigh[pivotLen], right=endBar, bottom=minLow[pivotLen], bgcolor=color.new(color.red, 92), border_color=color.new(color.red, 40))
+    label.new(x=math.round((startBar + endBar) / 2), y=minLow[pivotLen], text=boxTxt, color=color.new(color.red, 90), textcolor=color.red, style=label.style_label_up, size=size.small)
+
+    float currentEff = totalBoxHeight / (cumVol[pivotLen] > 0 ? cumVol[pivotLen] : 1.0)
+    smoothDownEff := na(smoothDownEff) ? currentEff : (alpha * currentEff + (1.0 - alpha) * smoothDownEff)
+
+    activeTrend := 1
+    startPrice := pl
+    startBar := endBar
+    maxHigh := high
+    minLow := low
+    maxHighBar := bar_index
+    minLowBar := bar_index
+    cumVol  := 0.0
+    buyVol  := 0.0
+    sellVol := 0.0
+    buyLen  := 0.0
+    sellLen := 0.0
+    for i = 0 to pivotLen
+        cumVol += volume[i]
+        if high[i] > maxHigh
+            maxHigh := high[i]
+            maxHighBar := bar_index - i
+        if low[i] < minLow
+            minLow := low[i]
+            minLowBar := bar_index - i
+        bool isGreen = (close[i] >= open[i])
+        float cHeight = high[i] - low[i]
+        if isGreen
+            buyVol  += volume[i]
+            buyLen  += cHeight
+        else
+            sellVol += volume[i]
+            sellLen += cHeight
+
+//=========================
+// 2. INITIALIZATION ROUTINE
+//=========================
+if activeTrend == 0
+    if not na(pl)
+        activeTrend := 1
+        startPrice := pl
+        startBar := bar_index - pivotLen
+        cumVol  := 0.0
+        buyVol  := 0.0
+        sellVol := 0.0
+        buyLen  := 0.0
+        sellLen := 0.0
+        maxHigh := high
+        minLow := low
+        maxHighBar := bar_index
+        minLowBar := bar_index
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+            if high[i] > maxHigh
+                maxHigh := high[i]
+                maxHighBar := bar_index - i
+            if low[i] < minLow
+                minLow := low[i]
+                minLowBar := bar_index - i
+            bool isGreen = (close[i] >= open[i])
+            float cHeight = high[i] - low[i]
+            if isGreen
+                buyVol  += volume[i]
+                buyLen  += cHeight
+            else
+                sellVol += volume[i]
+                sellLen += cHeight
+    else if not na(ph)
+        activeTrend := -1
+        startPrice := ph
+        startBar := bar_index - pivotLen
+        cumVol  := 0.0
+        buyVol  := 0.0
+        sellVol := 0.0
+        buyLen  := 0.0
+        sellLen := 0.0
+        maxHigh := high
+        minLow := low
+        maxHighBar := bar_index
+        minLowBar := bar_index
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+            if high[i] > maxHigh
+                maxHigh := high[i]
+                maxHighBar := bar_index - i
+            if low[i] < minLow
+                minLow := low[i]
+                minLowBar := bar_index - i
+            bool isGreen = (close[i] >= open[i])
+            float cHeight = high[i] - low[i]
+            if isGreen
+                buyVol  += volume[i]
+                buyLen  += cHeight
+            else
+                sellVol += volume[i]
+                sellLen += cHeight
+
+//=========================
+// 3. ACCUMULATE VOLUME, BOUNDARIES & INVALIDATIONS
+//=========================
+else
+    cumVol += volume
+    if high > maxHigh
+        maxHigh := high
+        maxHighBar := bar_index
+    if low < minLow
+        minLow := low
+        minLowBar := bar_index
+    
+    bool isGreen = (close >= open)
+    float cHeight = high - low
+    if isGreen
+        buyVol  += volume
+        buyLen  += cHeight
+    else
+        sellVol += volume
+        sellLen += cHeight
+
+    // --- STRUCTURAL BREAKOUT / INVALIDATION DETECTOR ---
+    if activeTrend == -1 and high > startPrice
+        int endBar = bar_index
+        float totalBoxHeight = maxHigh - minLow
+        float finalBuyRatio  = buyLen > 0 ? buyVol / buyLen : 0.0
+        float finalSellRatio = sellLen > 0 ? sellVol / sellLen : 0.0
+        
+        // Trend Comparison Arrows vs Previous Box
+        string buyArrow  = na(lastBoxBuyRatio) ? "—" : (finalBuyRatio > lastBoxBuyRatio ? "▲ (Inc)" : "▼ (Dec)")
+        string sellArrow = na(lastBoxSellRatio) ? "—" : (finalSellRatio > lastBoxSellRatio ? "▲ (Inc)" : "▼ (Dec)")
+        
+        lastBoxBuyRatio  := finalBuyRatio
+        lastBoxSellRatio := finalSellRatio
+        
+        float expectedMove = not na(smoothDownEff) ? smoothDownEff * cumVol : na
+        if not na(expectedMove) and expectedMove >= totalBoxHeight + (atrMult * atr) and allowSignal and (buyVol > sellVol)
+            label.new(x=endBar, y=na, text="▲", yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+            strategy.entry("Buy", strategy.long)
+
+        string expStr = not na(expectedMove) ? str.tostring(expectedMove, "#.##") : "N/A"
+        string boxTxt = "V: " + str.tostring(cumVol, format.volume) + "\nAct H: " + str.tostring(totalBoxHeight, "#.##") + "\nExp H: " + expStr + "\nBuy Vol: " + str.tostring(buyVol, format.volume) + "\nSell Vol: " + str.tostring(sellVol, format.volume) + "\nBuy Ratio: " + str.tostring(finalBuyRatio, "#.##") + " " + buyArrow + "\nSell Ratio: " + str.tostring(finalSellRatio, "#.##") + " " + sellArrow
+
+        box.new(left=startBar, top=maxHigh, right=endBar, bottom=minLow, bgcolor=color.new(color.red, 92), border_color=color.new(color.red, 40))
+        label.new(x=math.round((startBar + endBar) / 2), y=minLow, text=boxTxt, color=color.new(color.red, 90), textcolor=color.red, style=label.style_label_up, size=size.small)
+
+        activeTrend := 1
+        startPrice := minLow
+        startBar := na(minLowBar) ? bar_index : minLowBar
+        cumVol := 0.0
+        buyVol := 0.0
+        sellVol := 0.0
+        buyLen := 0.0
+        sellLen := 0.0
+        maxHigh := high
+        minLow := startPrice
+        maxHighBar := bar_index
+        minLowBar := bar_index
+        
+        int limit = bar_index - startBar
+        if limit >= 0
+            for i = limit to 0
+                cumVol += volume[i]
+                maxHigh := math.max(maxHigh, high[i])
+                minLow := math.min(minLow, low[i])
+                bool isG = (close[i] >= open[i])
+                float hg = high[i] - low[i]
+                if isG
+                    buyVol  += volume[i]
+                    buyLen  += hg
+                else
+                    sellVol += volume[i]
+                    sellLen += hg
+                    
+    else if activeTrend == 1 and low < startPrice
+        int endBar = bar_index
+        float totalBoxHeight = maxHigh - minLow
+        float finalBuyRatio  = buyLen > 0 ? buyVol / buyLen : 0.0
+        float finalSellRatio = sellLen > 0 ? sellVol / sellLen : 0.0
+        
+        // Trend Comparison Arrows vs Previous Box
+        string buyArrow  = na(lastBoxBuyRatio) ? "—" : (finalBuyRatio > lastBoxBuyRatio ? "▲ (Inc)" : "▼ (Dec)")
+        string sellArrow = na(lastBoxSellRatio) ? "—" : (finalSellRatio > lastBoxSellRatio ? "▲ (Inc)" : "▼ (Dec)")
+        
+        lastBoxBuyRatio  := finalBuyRatio
+        lastBoxSellRatio := finalSellRatio
+        
+        float expectedMove = not na(smoothUpEff) ? smoothUpEff * cumVol : na
+        if not na(expectedMove) and expectedMove >= totalBoxHeight + (atrMult * atr) and allowSignal and (sellVol > buyVol)
+            label.new(x=endBar, y=na, text="▼", yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+            strategy.entry("Sell", strategy.short)
+
+        string expStr = not na(expectedMove) ? str.tostring(expectedMove, "#.##") : "N/A"
+        string boxTxt = "V: " + str.tostring(cumVol, format.volume) + "\nAct H: " + str.tostring(totalBoxHeight, "#.##") + "\nExp H: " + expStr + "\nBuy Vol: " + str.tostring(buyVol, format.volume) + "\nSell Vol: " + str.tostring(sellVol, format.volume) + "\nBuy Ratio: " + str.tostring(finalBuyRatio, "#.##") + " " + buyArrow + "\nSell Ratio: " + str.tostring(finalSellRatio, "#.##") + " " + sellArrow
+
+        box.new(left=startBar, top=maxHigh, right=endBar, bottom=minLow, bgcolor=color.new(color.green, 92), border_color=color.new(color.green, 40))
+        label.new(x=math.round((startBar + endBar) / 2), y=maxHigh, text=boxTxt, color=color.new(color.green, 90), textcolor=color.green, style=label.style_label_up, size=size.small)
+
+        activeTrend := -1
+        startPrice := maxHigh
+        startBar := na(maxHighBar) ? bar_index : maxHighBar
+        cumVol := 0.0
+        buyVol := 0.0
+        sellVol := 0.0
+        buyLen := 0.0
+        sellLen := 0.0
+        maxHigh := startPrice
+        minLow := low
+        maxHighBar := bar_index
+        minLowBar := bar_index
+
+        int limit = bar_index - startBar
+        if limit >= 0
+            for i = limit to 0
+                cumVol += volume[i]
+                maxHigh := math.max(maxHigh, high[i])
+                minLow := math.min(minLow, low[i])
+                bool isG = (close[i] >= open[i])
+                float hg = high[i] - low[i]
+                if isG
+                    buyVol  += volume[i]
+                    buyLen  += hg
+                else
+                    sellVol += volume[i]
+                    sellLen += hg
+
+//=========================
+// 4. LIVE ENGINE & REAL-TIME PRE-SIGNAL LAYER
+//=========================
+if activeTrend != 0
+    bool liveIsUp = (activeTrend == 1)
+    float liveTotalBoxHeight = maxHigh - minLow
+    float liveExpectedMove = na
+    
+    if liveIsUp and not na(smoothUpEff)
+        liveExpectedMove := smoothUpEff * cumVol
+    else if not liveIsUp and not na(smoothDownEff)
+        liveExpectedMove := smoothDownEff * cumVol
+        
+    float liveBuyRatio  = buyLen > 0 ? buyVol / buyLen : 0.0
+    float liveSellRatio = sellLen > 0 ? sellVol / sellLen : 0.0
+    
+    string liveExpStr = not na(liveExpectedMove) ? str.tostring(liveExpectedMove, "#.##") : "N/A"
+    string liveBoxTxt = "V: " + str.tostring(cumVol, format.volume) + "\nAct H: " + str.tostring(liveTotalBoxHeight, "#.##") + "\nExp H: " + liveExpStr + "\nBuy Vol: " + str.tostring(buyVol, format.volume) + "\nSell Vol: " + str.tostring(sellVol, format.volume) + "\nBuy Ratio: " + str.tostring(liveBuyRatio, "#.##") + "\nSell Ratio: " + str.tostring(liveSellRatio, "#.##")
+            
+    color liveColor = liveIsUp ? color.green : color.red
+    
+    liveBox := box.new(left=startBar, top=maxHigh, right=bar_index, bottom=minLow, bgcolor=color.new(liveColor, 95), border_color=color.new(liveColor, 50), border_style=line.style_dashed)
+    liveLabel := label.new(x=math.round((startBar + bar_index) / 2), y=liveIsUp ? maxHigh : minLow, text=liveBoxTxt, color=color.new(liveColor, 90), textcolor=liveColor, style=liveIsUp ? label.style_label_down : label.style_label_up, size=size.small)
+
+//=========================
+// 5. STOP LOSS & TAKE PROFIT MANAGEMENT
+//=========================
+if strategy.position_size > 0
+    strategy.exit("Exit Long", "Buy", stop = strategy.position_avg_price * 0.99, limit = strategy.position_avg_price * 3.5)
+else if strategy.position_size < 0
+    strategy.exit("Exit Short", "Sell", stop = strategy.position_avg_price * 1.01, limit = strategy.position_avg_price / 3.5)

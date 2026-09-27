@@ -1,0 +1,207 @@
+//@version=5
+strategy("Trend Volume & Price Momentum (Dynamic Direction)", overlay = true, max_boxes_count = 500, max_labels_count = 500, initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100)
+
+//=========================
+// Inputs
+//=========================
+boxSize            = input.int(4, "Fixed Candle Count Per Box", minval = 1)
+smoothingLen       = input.int(8, "History Smoothing Length (Boxes)", minval = 1)
+atrLen             = input.int(14, "ATR Volatility Length")
+filterWeekend      = input.bool(false, "Filter Out Weekend Signals?")
+
+// --- VOLUME IMBALANCE INPUTS ---
+sensitivityFactor  = input.float(1.0, "Compression Sensitivity", minval = 0.5, maxval = 1.0, step = 0.05, group = "Frequency Engine")
+enableVolImbalance = input.bool(true, "Enable Box Volume Imbalance Filter", group = "Volume Imbalance Engine")
+volRatioThreshold  = input.float(1.36, "Volume Multiplier Threshold (x Prev 8 Boxes Avg)", minval = 1.0, step = 0.1, group = "Volume Imbalance Engine")
+showPocLine        = input.bool(true, "Draw Box POC Lines?", group = "Volume Profile / POC Engine")
+
+//=========================
+// Market Variables & Filters
+//=========================
+isWeekend   = dayofweek(time) == 7 or dayofweek(time) == 1
+allowSignal = not filterWeekend or not isWeekend
+alpha       = 2.0 / (smoothingLen + 1)
+
+//=========================
+// State Tracking Variables
+//=========================
+var int barCounter = 0
+var float cumVol   = 0.0
+
+// Rolling History Buffers for Previous 8 Box Volumes (Separated by Direction)
+var float[] pastBuyBoxVolumes  = array.new_float(0)
+var float[] pastSellBoxVolumes = array.new_float(0)
+
+// Smoothed efficiency baselines (Cross-referenced: Buy uses Sell Avg, Sell uses Buy Avg)
+var float smoothUpEff   = na
+var float smoothDownEff = na
+
+// Extreme boundary & open trackers
+var float maxHigh   = high
+var float minLow    = low
+var int startBar    = bar_index
+var float startOpen = open
+
+// Persistent dynamic handles
+var box liveBox     = na
+var label liveLabel = na
+var line livePocLine= na
+
+if not na(liveBox)
+    box.delete(liveBox)
+if not na(liveLabel)
+    label.delete(liveLabel)
+if not na(livePocLine)
+    line.delete(livePocLine)
+
+noOpenPosition = strategy.position_size == 0
+
+//=========================
+// HELPER FUNCTION: POC
+//=========================
+f_get_poc(int leftBar, int rightBar) =>
+    float maxBarVol = -1.0
+    float pocPrice  = na
+    int offsetToLeft  = bar_index - leftBar
+    int offsetToRight = bar_index - rightBar
+    
+    if offsetToLeft >= 0 and offsetToRight >= 0
+        for i = offsetToRight to offsetToLeft
+            if volume[i] > maxBarVol
+                maxBarVol := volume[i]
+                pocPrice := (high[i] + low[i] + close[i]) / 3.0
+    [pocPrice, maxBarVol]
+
+//=========================
+// BAR ACCUMULATION
+//=========================
+barCounter := barCounter + 1
+cumVol     := cumVol + volume
+maxHigh    := math.max(maxHigh, high)
+minLow     := math.min(minLow, low)
+
+if barCounter == 1
+    startOpen := open
+
+//=========================
+// BOX CLOSING ENGINE (EVERY 8 CANDLES)
+//=========================
+if barCounter >= boxSize
+    int endBar             = bar_index
+    float totalBoxHeight = maxHigh - minLow
+    float expectedMove   = na
+
+    // DYNAMIC DIRECTION DETERMINATION: Based purely on actual 8-candle price move
+    bool isBullishBox   = close >= startOpen
+    color boxColBg      = isBullishBox ? color.new(color.green, 92) : color.new(color.red, 92)
+    color boxColBorder = isBullishBox ? color.new(color.green, 40) : color.new(color.red, 40)
+    color boxColText   = isBullishBox ? color.green : color.red
+
+    // --- SELL LOGIC: Completed Box is BULLISH (GREEN) -> Uses SELL (Bearish) Past 8 Boxes Average ---
+    if isBullishBox
+        float avgSellVol = na
+        if array.size(pastSellBoxVolumes) > 0
+            avgSellVol := array.avg(pastSellBoxVolumes)
+
+        bool volImbalancePass = not enableVolImbalance or na(avgSellVol) or (cumVol >= avgSellVol * volRatioThreshold)
+        float currentEff      = totalBoxHeight / (cumVol > 0 ? cumVol : 1.0)
+
+        if not na(smoothUpEff)
+            expectedMove := smoothUpEff * cumVol
+            bool expGreaterThanAct = not na(expectedMove) and ((expectedMove * sensitivityFactor) > totalBoxHeight)
+            
+            if expGreaterThanAct and volImbalancePass and allowSignal and noOpenPosition
+                label.new(x=endBar, y=na, text="▼", yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+                strategy.entry("Sell", strategy.short)
+
+        smoothUpEff := na(smoothUpEff) ? currentEff : (alpha * currentEff + (1.0 - alpha) * smoothUpEff)
+        
+        // Push to Sell Box Volume History
+        array.push(pastSellBoxVolumes, cumVol)
+        if array.size(pastSellBoxVolumes) > 8
+            array.shift(pastSellBoxVolumes)
+
+    // --- BUY LOGIC: Completed Box is BEARISH (RED) -> Uses BUY (Bullish) Past 8 Boxes Average ---
+    else
+        float avgBuyVol = na
+        if array.size(pastBuyBoxVolumes) > 0
+            avgBuyVol := array.avg(pastBuyBoxVolumes)
+
+        bool volImbalancePass = not enableVolImbalance or na(avgBuyVol) or (cumVol >= avgBuyVol * volRatioThreshold)
+        float currentEff      = totalBoxHeight / (cumVol > 0 ? cumVol : 1.0)
+
+        if not na(smoothDownEff)
+            expectedMove := smoothDownEff * cumVol
+            bool expGreaterThanAct = not na(expectedMove) and ((expectedMove * sensitivityFactor) > totalBoxHeight)
+            
+            if expGreaterThanAct and volImbalancePass and allowSignal and noOpenPosition
+                label.new(x=endBar, y=na, text="▲", yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+                strategy.entry("Buy", strategy.long)
+
+        smoothDownEff := na(smoothDownEff) ? currentEff : (alpha * currentEff + (1.0 - alpha) * smoothDownEff)
+
+        // Push to Buy Box Volume History
+        array.push(pastBuyBoxVolumes, cumVol)
+        if array.size(pastBuyBoxVolumes) > 2
+            array.shift(pastBuyBoxVolumes)
+
+    // --- Visual Drawings ---
+    [pocPrice, pocVol] = f_get_poc(startBar, endBar)
+
+    string expStr = not na(expectedMove) ? str.tostring(expectedMove, "#.##") : "N/A"
+    string pocStr = not na(pocPrice) ? str.tostring(pocPrice, "#.##") : "N/A"
+    string boxTxt = "V: " + str.tostring(cumVol, format.volume) + "\nPOC: " + pocStr + "\nAct H: " + str.tostring(totalBoxHeight, "#.##") + "\nExp H: " + expStr
+
+    box.new(left=startBar, top=maxHigh, right=endBar, bottom=minLow, bgcolor=boxColBg, border_color=boxColBorder)
+    label.new(x=math.round((startBar + endBar) / 2), y=isBullishBox ? maxHigh : minLow, text=boxTxt, color=color.new(boxColText, 90), textcolor=boxColText, style=isBullishBox ? label.style_label_down : label.style_label_up, size=size.small)
+    
+    if showPocLine and not na(pocPrice)
+        line.new(x1=startBar, y1=pocPrice, x2=endBar, y2=pocPrice, color=color.yellow, width=2)
+
+    // Reset counters and boundaries for next box
+    barCounter := 0
+    cumVol     := 0.0
+    startBar   := bar_index + 1
+    startOpen  := open
+    maxHigh    := high
+    minLow     := low
+
+//=========================
+// LIVE ENGINE LAYER
+//=========================
+else
+    bool liveIsBullish = close >= startOpen
+    float liveTotalBoxHeight = maxHigh - minLow
+    float liveExpectedMove = na
+    
+    if liveIsBullish and not na(smoothUpEff)
+        liveExpectedMove := smoothUpEff * cumVol
+    else if not liveIsBullish and not na(smoothDownEff)
+        liveExpectedMove := smoothDownEff * cumVol
+    
+    [livePocPrice, livePocVol] = f_get_poc(startBar, bar_index)
+
+    // Select correct opposing 8-box average for live ratio display
+    float targetAvgVol = liveIsBullish ? (array.size(pastSellBoxVolumes) > 0 ? array.avg(pastSellBoxVolumes) : na) : (array.size(pastBuyBoxVolumes) > 0 ? array.avg(pastBuyBoxVolumes) : na)
+    float ratioVsPrev  = not na(targetAvgVol) and targetAvgVol > 0 ? (cumVol / targetAvgVol) : na
+    string ratioStr    = not na(ratioVsPrev) ? str.tostring(ratioVsPrev, "#.##") + "x" : "N/A"
+
+    string liveExpStr = not na(liveExpectedMove) ? str.tostring(liveExpectedMove, "#.##") : "N/A"
+    string livePocStr = not na(livePocPrice) ? str.tostring(livePocPrice, "#.##") : "N/A"
+    string liveBoxTxt = "Bars: " + str.tostring(barCounter) + "/" + str.tostring(boxSize) + "\nVol Ratio (Opp Avg): " + ratioStr + "\nV: " + str.tostring(cumVol, format.volume) + "\nPOC: " + livePocStr + "\nAct H: " + str.tostring(liveTotalBoxHeight, "#.##") + "\nExp H: " + liveExpStr
+            
+    color liveColor = liveIsBullish ? color.green : color.red
+    
+    liveBox := box.new(left=startBar, top=maxHigh, right=bar_index, bottom=minLow, bgcolor=color.new(liveColor, 95), border_color=color.new(liveColor, 50), border_style=line.style_dashed)
+    liveLabel := label.new(x=math.round((startBar + bar_index) / 2), y=liveIsBullish ? maxHigh : minLow, text=liveBoxTxt, color=color.new(liveColor, 90), textcolor=liveColor, style=liveIsBullish ? label.style_label_down : label.style_label_up, size=size.small)
+    
+    if showPocLine and not na(livePocPrice)
+        livePocLine := line.new(x1=startBar, y1=livePocPrice, x2=bar_index, y2=livePocPrice, color=color.yellow, style=line.style_dashed, width=2)
+
+//=========================
+// STOP LOSS & TAKE PROFIT
+//=========================
+if strategy.position_size > 0
+    strategy.exit("Exit Long", "Buy", stop = strategy.position_avg_price * 0.985, limit = strategy.position_avg_price * 1.045)
+else if strategy.position_size < 0
+    strategy.exit("Exit Short", "Sell", stop = strategy.position_avg_price * 1.015, limit = strategy.position_avg_price * 0.955)

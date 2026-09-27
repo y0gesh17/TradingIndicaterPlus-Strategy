@@ -1,0 +1,139 @@
+//@version=5
+indicator("Trend Volume & Price Momentum (Alpha Engine - Fixed 12-Candle Blocks)", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+//=========================
+// Inputs
+//=========================
+boxLen       = input.int(12, "Fixed Box Length (Candles)", minval = 1, tooltip = "Forces evaluation exactly every N candles.")
+smoothingLen = input.int(4, "History Smoothing Length (Boxes)", minval = 1, tooltip = "Smooths out single-box volume/height anomalies.")
+atrLen       = input.int(14, "ATR Volatility Length")
+atrMult      = input.float(1.5, "ATR Threshold Multiplier", tooltip = "Replaces fixed point limits with dynamic volatility ranges.")
+filterWeekend= input.bool(false, "Filter Out Weekend Signals?")
+
+//=========================
+// Market Variables & Filters
+//=========================
+isWeekend = dayofweek(time) == 7 or dayofweek(time) == 1
+allowSignal = not filterWeekend or not isWeekend
+atr = ta.atr(atrLen)
+alpha = 2.0 / (smoothingLen + 1) // EMA smoothing multiplier for box history
+
+//=========================
+// State Tracking Variables
+//=========================
+var int barCounter  = 0
+var int startBar    = na
+var float blockOpen = na
+var float cumVol    = 0.0
+var float maxHigh   = na
+var float minLow    = na
+
+// Smoothed efficiency baselines (Total Height / Volume)
+var float smoothUpEff = na
+var float smoothDownEff = na
+
+//=========================
+// PERSISTENT LIVE DRAWING TRACKERS
+//=========================
+var box liveBox = na
+var label liveLabel = na
+
+// Instantly purge real-time instances from the previous tick to avoid memory leaks
+if not na(liveBox)
+    box.delete(liveBox)
+if not na(liveLabel)
+    label.delete(liveLabel)
+
+//=========================
+// 1. BLOCK COUNTER & ACCUMULATION
+//=========================
+barCounter := barCounter + 1
+
+if barCounter == 1
+    startBar  := bar_index
+    blockOpen := open
+    cumVol    := volume
+    maxHigh   := high
+    minLow    := low
+else
+    cumVol    := cumVol + volume
+    maxHigh   := math.max(maxHigh, high)
+    minLow    := math.min(minLow, low)
+
+//=========================
+// 2. BLOCK COMPLETION & SIGNAL EVALUATION
+//=========================
+if barCounter == boxLen
+    float totalBoxHeight = maxHigh - minLow
+    bool isUpTrend = (close >= blockOpen) // Classify macro block trend
+    int midBar = int(math.floor((startBar + bar_index) / 2))
+    
+    float expectedMove = na
+    string calcStr = "\nExp: N/A"
+    
+    if isUpTrend
+        if not na(smoothUpEff)
+            expectedMove := smoothUpEff * cumVol
+            calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct (Height): " + str.tostring(totalBoxHeight, "#.##")
+            
+            // Volatility Dynamic Threshold Check using Total Height
+            if not na(expectedMove) and expectedMove >= totalBoxHeight + (atrMult * atr) and allowSignal
+                label.new(x=bar_index, y=na, text="SELL", yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.normal)
+
+        box.new(left=startBar, top=maxHigh, right=bar_index, bottom=minLow, bgcolor=color.new(color.green, 100), border_color=color.new(color.green, 40))
+        string reportTxt = "V: " + str.tostring(cumVol, format.volume) + "\nH (Total Height): " + str.tostring(totalBoxHeight, "#.##") + "\nB: " + str.tostring(boxLen) + calcStr
+        label.new(x=midBar, y=na, text=reportTxt, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.green, 100), textcolor=color.green, size=size.small)
+
+        // Smooth current efficiency baseline into historical memory
+        float currentEff = totalBoxHeight / (cumVol > 0 ? cumVol : 1.0)
+        smoothUpEff := na(smoothUpEff) ? currentEff : (alpha * currentEff + (1.0 - alpha) * smoothUpEff)
+    else
+        if not na(smoothDownEff)
+            expectedMove := smoothDownEff * cumVol
+            calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct (Height): " + str.tostring(totalBoxHeight, "#.##")
+            
+            // Volatility Dynamic Threshold Check using Total Height
+            if not na(expectedMove) and expectedMove >= totalBoxHeight + (atrMult * atr) and allowSignal
+                label.new(x=bar_index, y=na, text="BUY", yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.normal)
+
+        box.new(left=startBar, top=maxHigh, right=bar_index, bottom=minLow, bgcolor=color.new(color.red, 100), border_color=color.new(color.red, 40))
+        string reportTxt = "V: " + str.tostring(cumVol, format.volume) + "\nH (Total Height): " + str.tostring(totalBoxHeight, "#.##") + "\nB: " + str.tostring(boxLen) + calcStr
+        label.new(x=midBar, y=na, text=reportTxt, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.red, 100), textcolor=color.red, size=size.small)
+
+        // Smooth current efficiency baseline into historical memory
+        float currentEff = totalBoxHeight / (cumVol > 0 ? cumVol : 1.0)
+        smoothDownEff := na(smoothDownEff) ? currentEff : (alpha * currentEff + (1.0 - alpha) * smoothDownEff)
+    
+    // Reset counter parameters cleanly to cycle the next fixed container
+    barCounter := 0
+
+//=========================
+// 3. LIVE ENGINE & REAL-TIME PRE-SIGNAL LAYER
+//=========================
+else if barCounter > 0
+    bool liveIsUp = (close >= blockOpen)
+    float liveTotalBoxHeight = maxHigh - minLow
+    int liveMidBar = int(math.floor((startBar + bar_index) / 2))
+    
+    float liveExpectedMove = na
+    string liveCalcStr = "\nExp: N/A"
+    bool preSignalTriggered = false
+    
+    if liveIsUp and not na(smoothUpEff)
+        liveExpectedMove := smoothUpEff * cumVol
+        liveCalcStr := "\nExp: " + str.tostring(liveExpectedMove, "#.##") + "\nAct (Height): " + str.tostring(liveTotalBoxHeight, "#.##")
+        preSignalTriggered := (liveExpectedMove >= liveTotalBoxHeight + (atrMult * atr))
+    else if not liveIsUp and not na(smoothDownEff)
+        liveExpectedMove := smoothDownEff * cumVol
+        liveCalcStr := "\nExp: " + str.tostring(liveExpectedMove, "#.##") + "\nAct (Height): " + str.tostring(liveTotalBoxHeight, "#.##")
+        preSignalTriggered := (liveExpectedMove >= liveTotalBoxHeight + (atrMult * atr))
+            
+    color liveColor = liveIsUp ? color.green : color.red
+    
+    // Render dynamic real-time dashed box boundaries inside the current developing 12-bar window
+    liveBox := box.new(left=startBar, top=maxHigh, right=bar_index, bottom=minLow, bgcolor=color.new(liveColor, 96), border_color=color.new(liveColor, 50), border_style=line.style_dashed)
+    
+    string alertPrefix = preSignalTriggered ? "⚠️ [EXHAUSTION ANOMALY] " : "[LIVE] "
+    string liveTxt = alertPrefix + "V: " + str.tostring(cumVol, format.volume) + "\nH (Total Height): " + str.tostring(liveTotalBoxHeight, "#.##") + "\nB: " + str.tostring(barCounter) + liveCalcStr
+    
+    liveLabel := label.new(x=liveMidBar, y=na, text=liveTxt, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(liveColor, 100), textcolor=liveColor, size=size.small)

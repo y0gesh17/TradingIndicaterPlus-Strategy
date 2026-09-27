@@ -1,0 +1,186 @@
+//@version=5
+indicator("Trend Volume & Price Momentum (Consolidation Filter)", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+//=========================
+// Inputs
+//=========================
+pivotLen    = input.int(5, "Pivot Length", minval = 1)
+atrLen      = input.int(14, "ATR Length", minval = 1)
+
+// New Consolidation Filters
+useAdxFilter = input.bool(true, "Use ADX Trend Filter", group="Consolidation Filters", tooltip="Blocks processing during low-trend/sideways environments.")
+adxThresh    = input.int(20, "Min ADX Strength", minval = 1, group="Consolidation Filters", tooltip="ADX below this value indicates consolidation. Standard is 20 or 25.")
+minWaveMult  = input.float(1.2, "Min Wave Size (ATR Mult)", minval = 0.0, step = 0.1, group="Consolidation Filters", tooltip="A wave must expand by at least this multiple of ATR to be recognized as a structural break.")
+
+//=========================
+// Volatility & Trend Engines
+//=========================
+atrValue = ta.atr(atrLen)
+
+// Calculate ADX (Average Directional Index)
+[plusDI, minusDI, adxValue] = ta.dmi(14, 14)
+isTrending = not useAdxFilter or adxValue > adxThresh
+minWaveSize = (na(atrValue) ? 0.0 : atrValue) * minWaveMult
+
+// Weekend Detection Logic
+isWeekend = dayofweek(time) == 7 or dayofweek(time) == 1
+
+//=========================
+// Pivot Detection
+//=========================
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+//=========================
+// Variables & State Tracking
+//=========================
+var int activeTrend = 0 // 1 = Accumulating Up, -1 = Accumulating Down, 0 = Initializing
+var float cumVol = 0.0
+
+var float startPrice = na
+var int startBar = na
+
+var int lastEndBar = na
+var float lastEndPrice = na
+
+// Historical trackers for previous moves
+var float prevUpVol = na
+var float prevUpLen = na
+var float prevDownVol = na
+var float prevDownLen = na
+
+//=========================
+// Dynamic Anchor Refinement Logic
+//=========================
+if activeTrend == 1 and not na(pl)
+    if pl < startPrice
+        startPrice := pl
+        startBar := bar_index - pivotLen
+        cumVol := 0.0
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+
+if activeTrend == -1 and not na(ph)
+    if ph > startPrice
+        startPrice := ph
+        startBar := bar_index - pivotLen
+        cumVol := 0.0
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+
+//=========================
+// 1. COMPLETE ACTIVE MOVES & INSTANTLY HANDOFF
+//=========================
+
+if activeTrend == 1 and not na(ph)
+    endPrice = ph
+    endBar = bar_index - pivotLen
+    priceLength = math.abs(endPrice - startPrice)
+    
+    // CONSOLIDATION CHECK: Only accept the pivot if market is trending AND wave expanded far enough
+    if isTrending and priceLength >= minWaveSize
+        barCount = endBar - startBar + 1
+        midBar = math.floor((startBar + endBar) / 2)
+
+        float expectedMove = na
+        string calcStr = "\nExp: N/A"
+        
+        if not na(prevUpVol) and prevUpVol > 0
+            expectedMove := (prevUpLen * cumVol) / prevUpVol
+            calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct: " + str.tostring(priceLength, "#.##")
+            
+            if not na(expectedMove) and expectedMove >= priceLength + 20.0 and not isWeekend
+                label.new(x=endBar, y=na, text="SELL", yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.normal)
+
+        // Structural Box
+        box.new(left=startBar, top=endPrice, right=endBar, bottom=startPrice, bgcolor=color.new(color.green, 100), border_color=color.new(color.green, 40))
+
+        // Data label
+        label.new(x=midBar, y=na, 
+             text="V: " + str.tostring(cumVol, format.volume) + 
+                  "\nL: " + str.tostring(priceLength, "#.##") + 
+                  "\nB: " + str.tostring(barCount) + calcStr, 
+             yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.green, 100), textcolor=color.green, size=size.small)
+
+        prevUpVol := cumVol
+        prevUpLen := priceLength
+
+        lastEndBar := endBar
+        lastEndPrice := endPrice
+        
+        activeTrend := -1
+        startPrice := endPrice
+        startBar := endBar
+        
+        cumVol := 0.0
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+
+if activeTrend == -1 and not na(pl)
+    endPrice = pl
+    endBar = bar_index - pivotLen
+    priceLength = math.abs(startPrice - endPrice)
+    
+    // CONSOLIDATION CHECK: Only accept the pivot if market is trending AND wave expanded far enough
+    if isTrending and priceLength >= minWaveSize
+        barCount = endBar - startBar + 1
+        midBar = math.floor((startBar + endBar) / 2)
+
+        float expectedMove = na
+        string calcStr = "\nExp: N/A"
+
+        if not na(prevDownVol) and prevDownVol > 0
+            expectedMove := (prevDownLen * cumVol) / prevDownVol
+            calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct: " + str.tostring(priceLength, "#.##")
+            
+            if not na(expectedMove) and expectedMove >= priceLength * 1.5 and not isWeekend
+                label.new(x=endBar, y=na, text="BUY", yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.normal)
+
+        // Structural Box
+        box.new(left=startBar, top=startPrice, right=endBar, bottom=endPrice, bgcolor=color.new(color.red, 100), border_color=color.new(color.red, 40))
+
+        // Data label
+        label.new(x=midBar, y=na, 
+             text="V: " + str.tostring(cumVol, format.volume) + 
+                  "\nL: " + str.tostring(priceLength, "#.##") + 
+                  "\nB: " + str.tostring(barCount) + calcStr, 
+             yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.red, 100), textcolor=color.red, size=size.small)
+
+        prevDownVol := cumVol
+        prevDownLen := priceLength
+
+        lastEndBar := endBar
+        lastEndPrice := endPrice
+        
+        activeTrend := 1
+        startPrice := endPrice
+        startBar := endBar
+        
+        cumVol := 0.0
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+
+//=========================
+// 2. INITIALIZATION ROUTINE
+//=========================
+if activeTrend == 0
+    if not na(pl)
+        activeTrend := 1
+        startPrice := pl
+        startBar := bar_index - pivotLen
+        cumVol := 0.0
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+    else if not na(ph)
+        activeTrend := -1
+        startPrice := ph
+        startBar := bar_index - pivotLen
+        cumVol := 0.0
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+
+//=========================
+// 3. ACCUMULATE VOLUME
+//=========================
+else
+    cumVol += volume

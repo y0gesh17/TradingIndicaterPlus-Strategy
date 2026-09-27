@@ -1,0 +1,467 @@
+//@version=5
+indicator("Trend Volume & Price Momentum (Inverted EMA 200 Trend Filter)", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+//=========================
+// Inputs
+//=========================
+pivotLen      = input.int(5, "Pivot Length", minval = 1)
+minMovePoints = input.float(20.0, "Minimum Box Length (Points)", minval = 0.0)
+emaLen        = input.int(200, "Trend Filter EMA Length", minval = 1)
+
+groupRegime = "Market Regime Engine"
+atrLen = input.int(14, "ATR Length", minval = 1, group = groupRegime)
+emaSlopeLen = input.int(20, "EMA Slope Lookback", minval = 1, group = groupRegime)
+emaSlopeThresholdAtr = input.float(0.10, "EMA Slope Threshold (ATR)", minval = 0.0, step = 0.01, group = groupRegime)
+pivotStructureLookback = input.int(8, "Pivot Structure Lookback", minval = 2, group = groupRegime)
+pivotStructureRequired = input.int(4, "Required HH/HL or LH/LL Count", minval = 1, group = groupRegime)
+emaDistanceTrendAtr = input.float(2.0, "Trending Distance From EMA (ATR)", minval = 0.0, step = 0.1, group = groupRegime)
+emaDistanceBalancedAtr = input.float(0.5, "Balanced Distance From EMA (ATR)", minval = 0.0, step = 0.1, group = groupRegime)
+adxLen = input.int(14, "ADX DI Length", minval = 1, group = groupRegime)
+adxSmoothing = input.int(14, "ADX Smoothing", minval = 1, group = groupRegime)
+adxTrendThreshold = input.float(25.0, "ADX Trending Threshold", minval = 0.0, step = 0.5, group = groupRegime)
+adxConsolidationThreshold = input.float(18.0, "ADX Consolidation Threshold", minval = 0.0, step = 0.5, group = groupRegime)
+strongUpScoreThreshold = input.int(7, "Strong Uptrend Score Threshold", minval = 1, group = groupRegime)
+strongDownScoreThreshold = input.int(-7, "Strong Downtrend Score Threshold", maxval = -1, group = groupRegime)
+showRegimeBackground = input.bool(true, "Show Regime Background", group = groupRegime)
+
+groupSignals = "Institutional Signal Engine"
+weakStrengthRatio = input.float(0.8, "Weak Move Strength Ratio", minval = 0.0, step = 0.05, group = groupSignals)
+strongStrengthRatio = input.float(1.2, "Strong Move Strength Ratio", minval = 0.0, step = 0.05, group = groupSignals)
+highEffortRatio = input.float(1.2, "High Effort Ratio", minval = 0.0, step = 0.05, group = groupSignals)
+efficientEffortRatio = input.float(0.8, "Efficient Effort Ratio", minval = 0.0, step = 0.05, group = groupSignals)
+volumeExpansionThreshold = input.float(1.2, "Volume Expansion Threshold", minval = 0.0, step = 0.05, group = groupSignals)
+minimumConfidence = input.int(80, "Minimum Confidence %", minval = 0, maxval = 100, group = groupSignals)
+signalCooldownBoxes = input.int(3, "Same-Side Signal Cooldown (Boxes)", minval = 0, group = groupSignals)
+
+//=========================
+// Trend Filter (EMA 200)
+//=========================
+ema200 = ta.ema(close, emaLen)
+plot(ema200, title="EMA 200", color=color.blue, linewidth=2)
+
+//=========================
+// Pivot Detection
+//=========================
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+//=========================
+// Variables & State Tracking
+//=========================
+var int activeTrend = 0 // 1 = Accumulating Up, -1 = Accumulating Down, 0 = Initializing
+var float cumVol = 0.0
+
+var float startPrice = na
+var int startBar = na
+
+// Multi-Box Merging Tracking Variables
+var float visualStartPrice = na
+var int visualStartBar = na
+var string lastDirection = ""
+var float mergedVol = 0.0
+
+var int lastEndBar = na
+var float lastEndPrice = na
+
+// Historical Structural Databases (Dynamic sizes)
+var float[] upStartPrices  = array.new_float(0)
+var float[] upVolHistory    = array.new_float(0)
+var float[] upLenHistory    = array.new_float(0)
+
+var float[] downStartPrices = array.new_float(0)
+var float[] downVolHistory  = array.new_float(0)
+var float[] downLenHistory  = array.new_float(0)
+
+// Confirmed pivots only. Pivots are known after pivotLen bars, so this does not use future data.
+var float[] pivotHighPrices = array.new_float(0)
+var float[] pivotLowPrices = array.new_float(0)
+if not na(ph)
+    array.push(pivotHighPrices, ph)
+    if array.size(pivotHighPrices) > 50
+        array.shift(pivotHighPrices)
+if not na(pl)
+    array.push(pivotLowPrices, pl)
+    if array.size(pivotLowPrices) > 50
+        array.shift(pivotLowPrices)
+
+var int completedBoxIndex = 0
+var int lastBuyBoxIndex = na
+var int lastSellBoxIndex = na
+var string lastSignalSide = ""
+var string lastSignalRegime = ""
+
+f_pivotCounts(_lookback) =>
+    int hh = 0
+    int hl = 0
+    int lh = 0
+    int ll = 0
+
+    int highSize = array.size(pivotHighPrices)
+    if highSize >= 2
+        int highPairs = math.min(_lookback, highSize - 1)
+        for i = 0 to highPairs - 1
+            float currentHigh = array.get(pivotHighPrices, highSize - 1 - i)
+            float previousHigh = array.get(pivotHighPrices, highSize - 2 - i)
+            if currentHigh > previousHigh
+                hh += 1
+            else if currentHigh < previousHigh
+                lh += 1
+
+    int lowSize = array.size(pivotLowPrices)
+    if lowSize >= 2
+        int lowPairs = math.min(_lookback, lowSize - 1)
+        for i = 0 to lowPairs - 1
+            float currentLow = array.get(pivotLowPrices, lowSize - 1 - i)
+            float previousLow = array.get(pivotLowPrices, lowSize - 2 - i)
+            if currentLow > previousLow
+                hl += 1
+            else if currentLow < previousLow
+                ll += 1
+
+    [hh, hl, lh, ll]
+
+f_clamp(_value, _min, _max) =>
+    math.max(_min, math.min(_max, _value))
+
+f_signalConfidence(_side, _legDirection, _strengthRatio, _effortRatio, _volumeExpansion, _trendScore, _marketState, _hh, _hl, _lh, _ll) =>
+    float confidence = 0.0
+
+    bool buySignal = _side == "BUY"
+    bool sellSignal = _side == "SELL"
+    bool weakReversal = _strengthRatio < weakStrengthRatio and ((buySignal and _legDirection == "DOWN") or (sellSignal and _legDirection == "UP"))
+    bool strongContinuation = _strengthRatio > strongStrengthRatio and ((buySignal and _legDirection == "UP") or (sellSignal and _legDirection == "DOWN"))
+
+    if (buySignal and _marketState == "UPTREND") or (sellSignal and _marketState == "DOWNTREND")
+        float requiredTrendScore = buySignal ? strongUpScoreThreshold : math.abs(strongDownScoreThreshold)
+        confidence += f_clamp(math.abs(_trendScore) / requiredTrendScore * 25.0, 0.0, 25.0)
+    else if _marketState == "CONSOLIDATION"
+        confidence += 15.0
+
+    if weakReversal or strongContinuation
+        confidence += 25.0
+
+    if weakReversal and _effortRatio >= highEffortRatio
+        confidence += 15.0
+    else if strongContinuation and _effortRatio <= efficientEffortRatio
+        confidence += 15.0
+    else if _effortRatio > 0
+        confidence += 8.0
+
+    if (buySignal and close < ema200) or (sellSignal and close > ema200)
+        confidence += _marketState == "CONSOLIDATION" ? 15.0 : 8.0
+    else if (buySignal and close > ema200) or (sellSignal and close < ema200)
+        confidence += _marketState == "CONSOLIDATION" ? 0.0 : 10.0
+
+    if buySignal and _hh >= pivotStructureRequired and _hl >= pivotStructureRequired
+        confidence += 15.0
+    else if sellSignal and _lh >= pivotStructureRequired and _ll >= pivotStructureRequired
+        confidence += 15.0
+    else
+        confidence += 5.0
+
+    if _volumeExpansion >= volumeExpansionThreshold
+        confidence += 10.0
+
+    f_clamp(confidence, 0.0, 100.0)
+
+f_regimeAllowsSignal(_side, _marketState) =>
+    bool allowed = false
+    if _marketState == "UPTREND"
+        allowed := _side == "BUY"
+    else if _marketState == "DOWNTREND"
+        allowed := _side == "SELL"
+    else
+        allowed := (_side == "BUY" and close < ema200) or (_side == "SELL" and close > ema200)
+    allowed
+
+f_plotSignal(_side, _x, _confidence) =>
+    if _side == "BUY"
+        label.new(x = _x, y = na, text = "BUY\n" + str.tostring(math.round(_confidence)) + "%", yloc = yloc.belowbar, style = label.style_label_up, color = color.green, textcolor = color.white, size = size.normal)
+    else if _side == "SELL"
+        label.new(x = _x, y = na, text = "SELL\n" + str.tostring(math.round(_confidence)) + "%", yloc = yloc.abovebar, style = label.style_label_down, color = color.red, textcolor = color.white, size = size.normal)
+
+[hhCount, hlCount, lhCount, llCount] = f_pivotCounts(pivotStructureLookback)
+atrValue = ta.atr(atrLen)
+emaSlope = ema200 - ema200[emaSlopeLen]
+emaSlopeThreshold = atrValue * emaSlopeThresholdAtr
+emaSlopeScore = emaSlope > emaSlopeThreshold ? 2 : emaSlope < -emaSlopeThreshold ? -2 : 0
+strongPivotUp = hhCount >= pivotStructureRequired and hlCount >= pivotStructureRequired
+strongPivotDown = lhCount >= pivotStructureRequired and llCount >= pivotStructureRequired
+pivotStructureScore = strongPivotUp ? 4 : strongPivotDown ? -4 : 0
+emaDistance = atrValue > 0 ? math.abs(close - ema200) / atrValue : 0.0
+[plusDI, minusDI, adxValue] = ta.dmi(adxLen, adxSmoothing)
+directionBias = emaSlopeScore > 0 ? 1 : emaSlopeScore < 0 ? -1 : close > ema200 ? 1 : close < ema200 ? -1 : 0
+distanceScore = emaDistance > emaDistanceTrendAtr ? directionBias : 0
+adxScore = adxValue > adxTrendThreshold ? directionBias : 0
+trendScore = emaSlopeScore + pivotStructureScore + distanceScore + adxScore
+balancedMarket = emaDistance < emaDistanceBalancedAtr or adxValue < adxConsolidationThreshold
+marketState = balancedMarket ? "CONSOLIDATION" : trendScore >= strongUpScoreThreshold ? "UPTREND" : trendScore <= strongDownScoreThreshold ? "DOWNTREND" : "CONSOLIDATION"
+
+var table regimeTable = table.new(position.top_right, 1, 2)
+if barstate.islast
+    color stateColor = marketState == "UPTREND" ? color.green : marketState == "DOWNTREND" ? color.red : color.gray
+    table.cell(regimeTable, 0, 0, marketState, bgcolor = color.new(stateColor, 15), text_color = color.white)
+    table.cell(regimeTable, 0, 1, "Score: " + str.tostring(trendScore) + " | ADX: " + str.tostring(adxValue, "#.##"), bgcolor = color.new(color.black, 60), text_color = color.white)
+
+bgcolor(showRegimeBackground ? marketState == "UPTREND" ? color.new(color.green, 92) : marketState == "DOWNTREND" ? color.new(color.red, 92) : color.new(color.gray, 94) : na)
+
+//=========================
+// 1. COMPLETE ACTIVE MOVES & INSTANTLY HANDOFF
+//=========================
+
+if activeTrend == 1 and not na(ph)
+    endPrice = ph
+    endBar = bar_index - pivotLen
+    
+    priceLength = math.abs(endPrice - startPrice)
+    barCount = endBar - startBar + 1
+    midBar = math.floor((startBar + endBar) / 2)
+
+    string currentDirection = endPrice >= startPrice ? "UP" : "DOWN"
+
+    if priceLength > minMovePoints
+        completedBoxIndex += 1
+        float expectedMove = na
+        string calcStr = "\nExp: N/A"
+        string legStatusStr = ""
+        float avgMoveVol = na
+        float avgMoveLen = na
+        
+        float dynamicVolSum = 0.0
+        float dynamicLenSum = 0.0
+        int validMatchCount = 0
+        
+        int totalStoredUp = array.size(upStartPrices)
+        if totalStoredUp > 0
+            float subsequentStartPrice = startPrice
+            
+            for i = totalStoredUp - 1 to 0
+                float currentHistStartPrice = array.get(upStartPrices, i)
+                
+                if currentHistStartPrice >= subsequentStartPrice
+                    break
+                
+                dynamicVolSum += array.get(upVolHistory, i)
+                dynamicLenSum += array.get(upLenHistory, i)
+                validMatchCount += 1
+                
+                subsequentStartPrice := currentHistStartPrice
+            
+            if validMatchCount > 0 and dynamicVolSum > 0
+                float avgUpVol = dynamicVolSum / validMatchCount
+                float avgUpLen = dynamicLenSum / validMatchCount
+                avgMoveVol := avgUpVol
+                avgMoveLen := avgUpLen
+                expectedMove := (avgUpLen * cumVol) / avgUpVol
+                float strengthRatio = expectedMove > 0 ? priceLength / expectedMove : na
+                float currentEffortPerPoint = priceLength > 0 ? cumVol / priceLength : na
+                float averageEffortPerPoint = avgMoveLen > 0 ? avgMoveVol / avgMoveLen : na
+                float effortRatio = not na(currentEffortPerPoint) and not na(averageEffortPerPoint) and averageEffortPerPoint > 0 ? currentEffortPerPoint / averageEffortPerPoint : na
+                float volumeExpansion = avgMoveVol > 0 ? cumVol / avgMoveVol : na
+                calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct: " + str.tostring(priceLength, "#.##") + "\nStr: " + str.tostring(strengthRatio, "#.##")
+                legStatusStr := "\nLegs Averaged: " + str.tostring(validMatchCount)
+                
+                string signalSide = ""
+                if not na(strengthRatio)
+                    if currentDirection == "UP"
+                        signalSide := strengthRatio < weakStrengthRatio ? "SELL" : strengthRatio > strongStrengthRatio ? "BUY" : ""
+                    else
+                        signalSide := strengthRatio < weakStrengthRatio ? "BUY" : strengthRatio > strongStrengthRatio ? "SELL" : ""
+
+                if signalSide != "" and f_regimeAllowsSignal(signalSide, marketState)
+                    float confidence = f_signalConfidence(signalSide, currentDirection, strengthRatio, effortRatio, volumeExpansion, trendScore, marketState, hhCount, hlCount, lhCount, llCount)
+                    bool cooldownOk = signalSide == "BUY" ? (na(lastBuyBoxIndex) or completedBoxIndex - lastBuyBoxIndex > signalCooldownBoxes) : (na(lastSellBoxIndex) or completedBoxIndex - lastSellBoxIndex > signalCooldownBoxes)
+                    bool duplicateOk = lastSignalSide == "" or signalSide != lastSignalSide or marketState != lastSignalRegime
+                    if confidence >= minimumConfidence and cooldownOk and duplicateOk
+                        f_plotSignal(signalSide, endBar, confidence)
+                        if signalSide == "BUY"
+                            lastBuyBoxIndex := completedBoxIndex
+                        else
+                            lastSellBoxIndex := completedBoxIndex
+                        lastSignalSide := signalSide
+                        lastSignalRegime := marketState
+            else
+                legStatusStr := "\nFirst Leg"
+        else
+            legStatusStr := "\nFirst Leg"
+
+        if currentDirection == lastDirection
+            mergedVol += cumVol
+        else
+            visualStartPrice := startPrice
+            visualStartBar := startBar
+            mergedVol := cumVol
+
+        color boxColor = currentDirection == "UP" ? color.green : color.red
+        color textColor = currentDirection == "UP" ? color.green : color.red
+        
+        float displayLength = math.abs(endPrice - visualStartPrice)
+        int displayBarCount = endBar - visualStartBar + 1
+        int displayMidBar = math.floor((visualStartBar + endBar) / 2)
+
+        box.new(left=visualStartBar, top=math.max(visualStartPrice, endPrice), right=endBar, bottom=math.min(visualStartPrice, endPrice), bgcolor=color.new(boxColor, 100), border_color=color.new(boxColor, 40))
+
+        label.new(x=displayMidBar, y=na, 
+             text="V: " + str.tostring(mergedVol, format.volume) + 
+                  "\nL: " + str.tostring(displayLength, "#.##") + 
+                  "\nB: " + str.tostring(displayBarCount) + calcStr + legStatusStr, 
+             yloc=yloc.belowbar, style=label.style_label_up, color=color.new(boxColor, 100), textcolor=textColor, size=size.small)
+
+        array.push(upStartPrices, startPrice)
+        array.push(upVolHistory, cumVol)
+        array.push(upLenHistory, priceLength)
+
+    lastDirection := currentDirection
+    lastEndBar := endBar
+    lastEndPrice := endPrice
+    
+    activeTrend := -1
+    startPrice := endPrice
+    startBar := endBar
+    
+    cumVol := 0.0
+    for i = 0 to pivotLen
+        cumVol += volume[i]
+
+if activeTrend == -1 and not na(pl)
+    endPrice = pl
+    endBar = bar_index - pivotLen
+    
+    priceLength = math.abs(startPrice - endPrice)
+    barCount = endBar - startBar + 1
+    midBar = math.floor((startBar + endBar) / 2)
+
+    string currentDirection = startPrice >= endPrice ? "DOWN" : "UP"
+
+    if priceLength > minMovePoints
+        completedBoxIndex += 1
+        float expectedMove = na
+        string calcStr = "\nExp: N/A"
+        string legStatusStr = ""
+        float avgMoveVol = na
+        float avgMoveLen = na
+
+        float dynamicVolSum = 0.0
+        float dynamicLenSum = 0.0
+        int validMatchCount = 0
+        
+        int totalStoredDown = array.size(downStartPrices)
+        if totalStoredDown > 0
+            float subsequentStartPrice = startPrice
+            
+            for i = totalStoredDown - 1 to 0
+                float currentHistStartPrice = array.get(downStartPrices, i)
+                
+                if currentHistStartPrice <= subsequentStartPrice
+                    break
+                
+                dynamicVolSum += array.get(downVolHistory, i)
+                dynamicLenSum += array.get(downLenHistory, i)
+                validMatchCount += 1
+                
+                subsequentStartPrice := currentHistStartPrice
+            
+            if validMatchCount > 0 and dynamicVolSum > 0
+                float avgDownVol = dynamicVolSum / validMatchCount
+                float avgDownLen = dynamicLenSum / validMatchCount
+                avgMoveVol := avgDownVol
+                avgMoveLen := avgDownLen
+                expectedMove := (avgDownLen * cumVol) / avgDownVol
+                float strengthRatio = expectedMove > 0 ? priceLength / expectedMove : na
+                float currentEffortPerPoint = priceLength > 0 ? cumVol / priceLength : na
+                float averageEffortPerPoint = avgMoveLen > 0 ? avgMoveVol / avgMoveLen : na
+                float effortRatio = not na(currentEffortPerPoint) and not na(averageEffortPerPoint) and averageEffortPerPoint > 0 ? currentEffortPerPoint / averageEffortPerPoint : na
+                float volumeExpansion = avgMoveVol > 0 ? cumVol / avgMoveVol : na
+                calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct: " + str.tostring(priceLength, "#.##") + "\nStr: " + str.tostring(strengthRatio, "#.##")
+                legStatusStr := "\nLegs Averaged: " + str.tostring(validMatchCount)
+                
+                string signalSide = ""
+                if not na(strengthRatio)
+                    if currentDirection == "DOWN"
+                        signalSide := strengthRatio < weakStrengthRatio ? "BUY" : strengthRatio > strongStrengthRatio ? "SELL" : ""
+                    else
+                        signalSide := strengthRatio < weakStrengthRatio ? "SELL" : strengthRatio > strongStrengthRatio ? "BUY" : ""
+
+                if signalSide != "" and f_regimeAllowsSignal(signalSide, marketState)
+                    float confidence = f_signalConfidence(signalSide, currentDirection, strengthRatio, effortRatio, volumeExpansion, trendScore, marketState, hhCount, hlCount, lhCount, llCount)
+                    bool cooldownOk = signalSide == "BUY" ? (na(lastBuyBoxIndex) or completedBoxIndex - lastBuyBoxIndex > signalCooldownBoxes) : (na(lastSellBoxIndex) or completedBoxIndex - lastSellBoxIndex > signalCooldownBoxes)
+                    bool duplicateOk = lastSignalSide == "" or signalSide != lastSignalSide or marketState != lastSignalRegime
+                    if confidence >= minimumConfidence and cooldownOk and duplicateOk
+                        f_plotSignal(signalSide, endBar, confidence)
+                        if signalSide == "BUY"
+                            lastBuyBoxIndex := completedBoxIndex
+                        else
+                            lastSellBoxIndex := completedBoxIndex
+                        lastSignalSide := signalSide
+                        lastSignalRegime := marketState
+            else
+                legStatusStr := "\nFirst Leg"
+        else
+            legStatusStr := "\nFirst Leg"
+
+        if currentDirection == lastDirection
+            mergedVol += cumVol
+        else
+            visualStartPrice := startPrice
+            visualStartBar := startBar
+            mergedVol := cumVol
+
+        color boxColor = currentDirection == "DOWN" ? color.red : color.green
+        color textColor = currentDirection == "DOWN" ? color.red : color.green
+
+        float displayLength = math.abs(visualStartPrice - endPrice)
+        int displayBarCount = endBar - visualStartBar + 1
+        int displayMidBar = math.floor((visualStartBar + endBar) / 2)
+
+        box.new(left=visualStartBar, top=math.max(visualStartPrice, endPrice), right=endBar, bottom=math.min(visualStartPrice, endPrice), bgcolor=color.new(boxColor, 100), border_color=color.new(boxColor, 40))
+
+        label.new(x=displayMidBar, y=na, 
+             text="V: " + str.tostring(mergedVol, format.volume) + 
+                  "\nL: " + str.tostring(displayLength, "#.##") + 
+                  "\nB: " + str.tostring(displayBarCount) + calcStr + legStatusStr, 
+             yloc=yloc.belowbar, style=label.style_label_up, color=color.new(boxColor, 100), textcolor=textColor, size=size.small)
+
+        array.push(downStartPrices, startPrice)
+        array.push(downVolHistory, cumVol)
+        array.push(downLenHistory, priceLength)
+
+    lastDirection := currentDirection
+    lastEndBar := endBar
+    lastEndPrice := endPrice
+    
+    activeTrend := 1
+    startPrice := endPrice
+    startBar := endBar
+    
+    cumVol := 0.0
+    for i = 0 to pivotLen
+        cumVol += volume[i]
+
+//=========================
+// 2. INITIALIZATION ROUTINE
+//=========================
+if activeTrend == 0
+    if not na(pl)
+        activeTrend := 1
+        startPrice := pl
+        startBar := bar_index - pivotLen
+        visualStartPrice := pl
+        visualStartBar := bar_index - pivotLen
+        cumVol := 0.0
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+    else if not na(ph)
+        activeTrend := -1
+        startPrice := ph
+        startBar := bar_index - pivotLen
+        visualStartPrice := ph
+        visualStartBar := bar_index - pivotLen
+        cumVol := 0.0
+        for i = 0 to pivotLen
+            cumVol += volume[i]
+
+//=========================
+// 3. ACCUMULATE VOLUME
+//=========================
+else
+    cumVol += volume

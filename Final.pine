@@ -1,0 +1,146 @@
+//@version=5
+indicator("Trend Volume & Price Momentum (True Directional Color Fix)", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+//=========================
+// Inputs
+//=========================
+pivotLen     = input.int(5, "Pivot Length", minval = 1)
+minMovePoints = input.float(20.0, "Minimum Move Points", minval = 0.0)
+
+//=========================
+// Pivot Detection
+//=========================
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+//=========================
+// Variables & State Tracking
+//=========================
+var int activeTrend = 0 // 1 = Accumulating Up, -1 = Accumulating Down, 0 = Initializing
+
+var float startPrice = na
+var int startBar = na
+
+// Running total of all volume from inception to calculate differences precisely
+totalCumVol = ta.cum(volume)
+
+// Historical trackers for previous qualifying moves to perform momentum math
+var float prevUpVol = na
+var float prevUpLen = na
+var float prevDownVol = na
+var float prevDownLen = na
+
+//=========================
+// 1. COMPLETE ACTIVE MOVES & INSTANTLY HANDOFF
+//=========================
+
+if activeTrend == 1 and not na(ph)
+    endPrice = ph
+    endBar = bar_index - pivotLen
+    
+    priceLength = math.abs(endPrice - startPrice)
+    barCount = endBar - startBar + 1
+    midBar = math.floor((startBar + endBar) / 2)
+
+    // PRECISE VOLUME CALCULATION
+    int endOffset = bar_index - endBar
+    int startOffset = bar_index - startBar + 1
+    float exactMoveVol = totalCumVol[endOffset] - (startOffset < bar_index + 1 ? totalCumVol[startOffset] : 0.0)
+
+    // Only consider the move if it's greater than 20 points
+    if priceLength > minMovePoints
+        float expectedMove = na
+        string calcStr = "\nExp: N/A"
+        
+        if not na(prevUpVol) and prevUpVol > 0
+            expectedMove := (prevUpLen * exactMoveVol) / prevUpVol
+            calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct: " + str.tostring(priceLength, "#.##")
+            
+            // Signal trigger if underperformed (Fires unconditionally now)
+            if priceLength < expectedMove
+                label.new(x=endBar, y=na, text="SELL", yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.normal)
+
+        // Dynamically assign correct color: if price ended higher than start, color it green; else red.
+        color boxColor = endPrice >= startPrice ? color.green : color.red
+        color textColor = endPrice >= startPrice ? color.green : color.red
+
+        // Structural Box
+        box.new(left=startBar, top=math.max(startPrice, endPrice), right=endBar, bottom=math.min(startPrice, endPrice), bgcolor=color.new(boxColor, 100), border_color=color.new(boxColor, 40))
+
+        // Data label pushed vertically outside/below the box
+        label.new(x=midBar, y=na, 
+             text="V: " + str.tostring(exactMoveVol, format.volume) + 
+                  "\nL: " + str.tostring(priceLength, "#.##") + 
+                  "\nB: " + str.tostring(barCount) + calcStr, 
+             yloc=yloc.belowbar, style=label.style_label_up, color=color.new(boxColor, 100), textcolor=textColor, size=size.small)
+
+        // Store current values as historical baseline for next up trend
+        prevUpVol := exactMoveVol
+        prevUpLen := priceLength
+
+    // --- SEAMLESS HANDOFF ---
+    activeTrend := -1
+    startPrice := endPrice
+    startBar := endBar
+
+if activeTrend == -1 and not na(pl)
+    endPrice = pl
+    endBar = bar_index - pivotLen
+    
+    priceLength = math.abs(startPrice - endPrice)
+    barCount = endBar - startBar + 1
+    midBar = math.floor((startBar + endBar) / 2)
+
+    // PRECISE VOLUME CALCULATION
+    int endOffset = bar_index - endBar
+    int startOffset = bar_index - startBar + 1
+    float exactMoveVol = totalCumVol[endOffset] - (startOffset < bar_index + 1 ? totalCumVol[startOffset] : 0.0)
+
+    // Only consider the move if it's greater than 20 points
+    if priceLength > minMovePoints
+        float expectedMove = na
+        string calcStr = "\nExp: N/A"
+
+        if not na(prevDownVol) and prevDownVol > 0
+            expectedMove := (prevDownLen * exactMoveVol) / prevDownVol
+            calcStr := "\nExp: " + str.tostring(expectedMove, "#.##") + "\nAct: " + str.tostring(priceLength, "#.##")
+            
+            // Signal trigger if underperformed (Fires unconditionally now)
+            if priceLength < expectedMove
+                label.new(x=endBar, y=na, text="BUY", yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.normal)
+
+        // Dynamically assign correct color: if price ended lower than start, color it red; else green.
+        color boxColor = startPrice >= endPrice ? color.red : color.green
+        color textColor = startPrice >= endPrice ? color.red : color.green
+
+        // Structural Box
+        box.new(left=startBar, top=math.max(startPrice, endPrice), right=endBar, bottom=math.min(startPrice, endPrice), bgcolor=color.new(boxColor, 100), border_color=color.new(boxColor, 40))
+
+        // Data label pushed vertically outside/below the box
+        label.new(x=midBar, y=na, 
+             text="V: " + str.tostring(exactMoveVol, format.volume) + 
+                  "\nL: " + str.tostring(priceLength, "#.##") + 
+                  "\nB: " + str.tostring(barCount) + calcStr, 
+             yloc=yloc.belowbar, style=label.style_label_up, color=color.new(boxColor, 100), textcolor=textColor, size=size.small)
+
+        // Store current values as historical baseline for next down trend
+        prevDownVol := exactMoveVol
+        prevDownLen := priceLength
+
+    // --- SEAMLESS HANDOFF ---
+    activeTrend := 1
+    startPrice := endPrice
+    startBar := endBar
+
+//=========================
+// 2. INITIALIZATION ROUTINE (Only runs once at start of history)
+//=========================
+if activeTrend == 0
+    if not na(pl)
+        activeTrend := 1
+        startPrice := pl
+        startBar := bar_index - pivotLen
+    else if not na(ph)
+        activeTrend := -1
+        startPrice := ph
+        startBar := bar_index - pivotLen

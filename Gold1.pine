@@ -1,0 +1,220 @@
+//@version=5
+strategy("Trend Volume & Price Momentum (Fixed Boxes)", 
+     overlay = true, 
+     max_boxes_count = 500, 
+     max_labels_count = 500, 
+     initial_capital = 10000, 
+     default_qty_type = strategy.percent_of_equity, 
+     default_qty_value = 2500, // 2500% for full 25x trade sizing
+     margin_long = 4,          // 4% required margin = 25x leverage
+     margin_short = 4)         // 4% required margin = 25x leverage
+//=========================
+// Inputs
+//=========================
+boxSize       = input.int(8, "Fixed Candle Count Per Box", minval = 1)
+filterWeekend = input.bool(false, "Filter Out Weekend Signals?")
+
+// --- ENGINE INPUTS ---
+sensitivityFactor = input.float(1.0, "Compression Sensitivity", minval = 0.5, maxval = 5.0, step = 0.05, group = "Frequency Engine")
+volMultThreshold  = input.float(1.8, "Volume Multiplier Threshold vs Prev Box", minval = 0.1, step = 0.1, group = "Volume Filters")
+showPocLine       = input.bool(true, "Draw Box POC Lines?", group = "Volume Profile / POC Engine")
+
+//=========================
+// Market Variables & Filters
+//=========================
+isWeekend   = dayofweek(time) == 7 or dayofweek(time) == 1
+allowSignal = not filterWeekend or not isWeekend
+
+//=========================
+// State Tracking Variables
+//=========================
+var int barCounter   = 0
+var float cumVol     = 0.0
+var float boxBuyVol  = 0.0
+var float boxSellVol = 0.0
+
+// Previous box volume tracking
+var float prevBoxBuyVol  = na
+var float prevBoxSellVol = na
+
+// Color-Specific Raw Efficiency Trackers (No Smoothing / No EMA)
+var float prevGreenBoxEff = na
+var float prevRedBoxEff   = na
+
+var float maxHigh   = high
+var float minLow    = low
+var int startBar    = bar_index
+var float startOpen = open
+
+// Live drawing handlers
+var box liveBox      = na
+var label liveLabel  = na
+var line livePocLine = na
+
+if not na(liveBox)
+    box.delete(liveBox)
+if not na(liveLabel)
+    label.delete(liveLabel)
+if not na(livePocLine)
+    line.delete(livePocLine)
+
+// Check if no open position exists
+noOpenPosition = strategy.position_size == 0
+
+//=========================
+// HELPER FUNCTION: POC
+//=========================
+f_get_poc(int leftBar, int rightBar) =>
+    float maxBarVol = -1.0
+    float pocPrice  = na
+    int offsetToLeft  = bar_index - leftBar
+    int offsetToRight = bar_index - rightBar
+    
+    if offsetToLeft >= 0 and offsetToRight >= 0
+        for i = offsetToRight to offsetToLeft
+            if volume[i] > maxBarVol
+                maxBarVol := volume[i]
+                pocPrice  := (high[i] + low[i] + close[i]) / 3.0
+    [pocPrice, maxBarVol]
+
+//=========================
+// BAR ACCUMULATION
+//=========================
+float curBuyVol  = close >= open ? volume : 0.0
+float curSellVol = close < open ? volume : 0.0
+
+barCounter := barCounter + 1
+cumVol     := cumVol + volume
+boxBuyVol  := boxBuyVol + curBuyVol
+boxSellVol := boxSellVol + curSellVol
+maxHigh    := math.max(maxHigh, high)
+minLow     := math.min(minLow, low)
+
+if barCounter == 1
+    startOpen := open
+
+//=========================
+// BOX CLOSING ENGINE
+//=========================
+if barCounter >= boxSize
+    int endBar           = bar_index
+    float totalBoxHeight = maxHigh - minLow
+    float expectedMove   = na
+
+    bool isBullishBox   = close >= startOpen
+    color boxColBg      = isBullishBox ? color.new(color.green, 92) : color.new(color.red, 92)
+    color boxColBorder  = isBullishBox ? color.new(color.green, 40) : color.new(color.red, 40)
+    color boxColText    = isBullishBox ? color.green : color.red
+
+    // Calculate current box efficiency (Height per unit Volume)
+    float currentEff = totalBoxHeight / (cumVol > 0 ? cumVol : 1.0)
+
+    // --- SELL LOGIC: Completed Box is BULLISH (GREEN) ---
+    if isBullishBox
+        // Expected height calculated ONLY using the PREVIOUS GREEN BOX efficiency
+        if not na(prevGreenBoxEff)
+            expectedMove := prevGreenBoxEff * cumVol
+            bool expGreaterThanAct = not na(expectedMove) and ((expectedMove * sensitivityFactor) > totalBoxHeight)
+            
+            // Condition: Current Green Box BUY Volume >= 2x Prev Box BUY Volume
+            bool buyVolPass = not na(prevBoxBuyVol) and (boxBuyVol >= prevBoxBuyVol * volMultThreshold)
+
+            if expGreaterThanAct and buyVolPass and allowSignal and noOpenPosition
+                label.new(x=endBar, y=na, text="▼", yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+                strategy.entry("Sell", strategy.short)
+
+        // Save current green box efficiency for the NEXT green box
+        prevGreenBoxEff := currentEff
+
+    // --- BUY LOGIC: Completed Box is BEARISH (RED) ---
+    else
+        // Expected height calculated ONLY using the PREVIOUS RED BOX efficiency
+        if not na(prevRedBoxEff)
+            expectedMove := prevRedBoxEff * cumVol
+            bool expGreaterThanAct = not na(expectedMove) and ((expectedMove * sensitivityFactor) > totalBoxHeight)
+            
+            // Condition: Current Red Box SELL Volume >= 2x Prev Box SELL Volume
+            bool sellVolPass = not na(prevBoxSellVol) and (boxSellVol >= prevBoxSellVol * volMultThreshold)
+
+            if expGreaterThanAct and sellVolPass and allowSignal and noOpenPosition
+                label.new(x=endBar, y=na, text="▲", yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+                strategy.entry("Buy", strategy.long)
+
+        // Save current red box efficiency for the NEXT red box
+        prevRedBoxEff := currentEff
+
+    // --- Visual Drawings ---
+    [pocPrice, pocVol] = f_get_poc(startBar, endBar)
+
+    string expStr  = not na(expectedMove) ? str.tostring(expectedMove, "#.##") : "N/A"
+    string pocStr  = not na(pocPrice) ? str.tostring(pocPrice, "#.##") : "N/A"
+    string prevBuyStr  = not na(prevBoxBuyVol) ? str.tostring(prevBoxBuyVol, format.volume) : "N/A"
+    string prevSellStr = not na(prevBoxSellVol) ? str.tostring(prevBoxSellVol, format.volume) : "N/A"
+
+    string boxTxt = "Tot V: " + str.tostring(cumVol, format.volume) + "\nBuy V: " + str.tostring(boxBuyVol, format.volume) + " (Prev: " + prevBuyStr + ")" + "\nSell V: " + str.tostring(boxSellVol, format.volume) + " (Prev: " + prevSellStr + ")" + "\nPOC: " + pocStr + "\nAct H: " + str.tostring(totalBoxHeight, "#.##") + "\nExp H: " + expStr
+
+    box.new(left=startBar, top=maxHigh, right=endBar, bottom=minLow, bgcolor=boxColBg, border_color=boxColBorder)
+    label.new(x=math.round((startBar + endBar) / 2), y=isBullishBox ? maxHigh : minLow, text=boxTxt, color=color.new(boxColText, 90), textcolor=boxColText, style=isBullishBox ? label.style_label_down : label.style_label_up, size=size.small)
+    
+    if showPocLine and not na(pocPrice)
+        line.new(x1=startBar, y1=pocPrice, x2=endBar, y2=pocPrice, color=color.yellow, width=2)
+
+    // Save current box volumes to history for next box comparison
+    prevBoxBuyVol  := boxBuyVol
+    prevBoxSellVol := boxSellVol
+
+    // Reset variables for next box cycle
+    barCounter := 0
+    cumVol     := 0.0
+    boxBuyVol  := 0.0
+    boxSellVol := 0.0
+    startBar   := bar_index + 1
+    startOpen  := open
+    maxHigh    := high
+    minLow     := low
+
+//=========================
+// LIVE ENGINE LAYER (UNCONFIRMED BOX)
+//=========================
+else
+    bool liveIsBullish = close >= startOpen
+    float liveTotalBoxHeight = maxHigh - minLow
+    float liveExpectedMove = na
+    
+    // Live calculation: Uses prevGreenBoxEff if currently Green, prevRedBoxEff if currently Red
+    if liveIsBullish and not na(prevGreenBoxEff)
+        liveExpectedMove := prevGreenBoxEff * cumVol
+    else if not liveIsBullish and not na(prevRedBoxEff)
+        liveExpectedMove := prevRedBoxEff * cumVol
+    
+    [livePocPrice, livePocVol] = f_get_poc(startBar, bar_index)
+
+    string liveExpStr  = not na(liveExpectedMove) ? str.tostring(liveExpectedMove, "#.##") : "N/A"
+    string livePocStr  = not na(livePocPrice) ? str.tostring(livePocPrice, "#.##") : "N/A"
+    string livePrevBuy  = not na(prevBoxBuyVol) ? str.tostring(prevBoxBuyVol, format.volume) : "N/A"
+    string livePrevSell = not na(prevBoxSellVol) ? str.tostring(prevBoxSellVol, format.volume) : "N/A"
+    
+    string liveBoxTxt = "Bars: " + str.tostring(barCounter) + "/" + str.tostring(boxSize) + "\nTot V: " + str.tostring(cumVol, format.volume) + "\nBuy V: " + str.tostring(boxBuyVol, format.volume) + " (Prev: " + livePrevBuy + ")" + "\nSell V: " + str.tostring(boxSellVol, format.volume) + " (Prev: " + livePrevSell + ")" + "\nPOC: " + livePocStr + "\nAct H: " + str.tostring(liveTotalBoxHeight, "#.##") + "\nExp H: " + liveExpStr
+            
+    color liveColor = liveIsBullish ? color.green : color.red
+    
+    liveBox   := box.new(left=startBar, top=maxHigh, right=bar_index, bottom=minLow, bgcolor=color.new(liveColor, 95), border_color=color.new(liveColor, 50), border_style=line.style_dashed)
+    liveLabel := label.new(x=math.round((startBar + bar_index) / 2), y=liveIsBullish ? maxHigh : minLow, text=liveBoxTxt, color=color.new(liveColor, 90), textcolor=liveColor, style=liveIsBullish ? label.style_label_down : label.style_label_up, size=size.small)
+    
+    if showPocLine and not na(livePocPrice)
+        livePocLine := line.new(x1=startBar, y1=livePocPrice, x2=bar_index, y2=livePocPrice, color=color.yellow, style=line.style_dashed, width=2)
+
+//=========================
+// STOP LOSS & TAKE PROFIT (0.5% SL / 1.0% TP - 1:2 R:R)
+//=========================
+//=========================
+// INPUTS & RISK MANAGEMENT (1:2 R:R)
+//=========================
+slPct = input.float(1.5, "Stop Loss %", step = 0.1, group = "Risk Management") / 100
+rrRatio = input.float(2.0, "Risk to Reward Ratio", step = 0.5, group = "Risk Management")
+tpPct = slPct * rrRatio
+
+if strategy.position_size > 0
+    strategy.exit("Exit Long", "Buy", stop = strategy.position_avg_price * (1.0 - slPct), limit = strategy.position_avg_price * (1.0 + tpPct))
+else if strategy.position_size < 0
+    strategy.exit("Exit Short", "Sell", stop = strategy.position_avg_price * (1.0 + slPct), limit = strategy.position_avg_price * (1.0 - tpPct))
